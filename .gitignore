@@ -1,0 +1,10 @@
+# 编译产物
+benchmarks/gemm_v0
+benchmarks/gemm_v1
+benchmarks/gemm_*
+a.out
+
+# Nsight 报告
+*.nsys-rep
+*.sqlite
+*.ncu-rep
