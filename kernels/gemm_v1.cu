@@ -17,9 +17,9 @@ __global__ void gemm_tiled(float* A, float* B, float* C, int M, int N, int K) {
     //
     // 反例（若改成列优先访问则会产生32路冲突，不要取消注释）：
     //   // for (int k=0;k<TILE;++k) sum += As[k][threadIdx.y] * Bs[threadIdx.x][k];
-    //   此时 As[k][ty] 地址 = base + (k*32 + ty)*4, Bank = (k*32+ty)%32 = ty
-    //   看似分散，但若写成 As[threadIdx.x][k] 则 Bank = (tx*32+k)%32 = k，32线程tx不同但Bank相同 -> 32路冲突
-    // 经典解法：__shared__ float As[TILE][TILE+1]; // 填充1列让stride=33，Bank=(tx*33+k)%32 彻底错开
+    //   - As[ty][k]: 同一warp ty相同,k相同 -> 32线程读同一地址 -> 广播，无冲突
+    //   - Bs[tx][k]: 同一warp k相同，tx 0-31连续 -> 32线程读非连续地址 -> 相同Bank，有冲突
+    // 经典解法：__shared__ float Bs[TILE][TILE+1]; 
     // =====================================================
 
     int row = blockIdx.y * TILE + threadIdx.y;
