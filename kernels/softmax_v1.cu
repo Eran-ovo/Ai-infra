@@ -3,6 +3,7 @@
 #include <cmath>
 #define BLOCK 256
 
+//softmax公式：softmax(x) = exp(x-max) / sum(exp(x-max))
 // 一行一个block，block内做两次归约：max -> sum
 __global__ void softmax_fused(const float* __restrict__ x, float* __restrict__ y, int N){
     int row = blockIdx.x;//该block要处理的行号
