@@ -16,7 +16,7 @@
 // flash_fwd：分块 + 在线 Softmax 的 Attention 前向
 //
 //   数学目标（对每一行 q）：
-//     O = softmax(q·K^T / √D) · V
+//     O = softmax(q·K^T/√D) · V
 //
 //   分块做法：不存整行 N 个分数，边看 KV 块边维护三个运行量：
 //     m   = 到目前为止见过的最大分数
@@ -71,15 +71,16 @@ __global__ void flash_fwd(const float* __restrict__ Q,
         }
         __syncthreads();                   // 等全 Block 搬完再算
 
-        // 4b. S[c] = q · Kc^T / √D，并记录块内最大值
+        // 4b. S[c] = q · Kc^T / √D ，并记录块内最大值
         float row_max = -1e20f;
         for (int c = 0; c < Bc; ++c) {
             float dot = 0.0f;
-            for (int d = 0; d < D; ++d) dot += q_reg[d] * Ktile[c][d];
-            dot /= sqrtf((float)D);
+            for (int d = 0; d < D; ++d) 
+                dot += q_reg[d] * Ktile[c][d];
+            dot /= sqrtf((float)D);          // 缩放
             S[c] = dot;
             row_max = fmaxf(row_max, dot);
-        }
+        }//此时 Q[Br*b.x+tid][D] 与 K^T[0-Bc*kv_blk+Bc-1][D] 的点积结果 S[c] 已经算完，且 row_max 是本块的最大分数
 
         // 4c. 更新 max，并算本块按新 max 归一的 exp 与 sum
         const float m_new = fmaxf(m_prev, row_max);
@@ -92,22 +93,26 @@ __global__ void flash_fwd(const float* __restrict__ Q,
         // 4d. 旧统计修正系数 alpha = exp(m_old - m_new)
         //     max 变大了，旧的 l/acc 都是按旧 max 归一的，要乘 alpha 缩小
         const float alpha = expf(m_prev - m_new);
-        const float l_new = l_prev * alpha + row_sum;
+        const float l_new = l_prev * alpha + row_sum;//修正之前的和并加上这一块的sum
 
-        // 4e. 分子累加：acc = acc·alpha + 本块权重 · V
+        // 4e. 分子累加：acc=Σ exp(S - m) · V
         for (int d = 0; d < D; ++d) {
             float pv = 0.0f;
-            for (int c = 0; c < Bc; ++c) pv += S[c] * Vtile[c][d];
+            for (int c = 0; c < Bc; ++c) 
+                pv += S[c] * Vtile[c][d];
             acc[d] = acc[d] * alpha + pv;
         }
+        //acc里存放了当前行的部分的（K/V从0-当前块）分子累加结果，l_new存放了当前行的部分的（K/V从0-当前块）分母累加结果
 
         m_prev = m_new;
         l_prev = l_new;
-        __syncthreads();                   // 下一轮要复用 Ktile，先等算完
+        __syncthreads();// 下一轮要复用 Ktile，先等算完
     }
+    //此时 acc 里存放了当前行的完整的分子累加结果，l_prev 存放了当前行的完整的分母累加结果
 
     // --- 5. 归一化写回：O = acc / l ----------------------------------------
-    for (int d = 0; d < D; ++d) O[q_row * D + d] = acc[d] / l_prev;
+    for (int d = 0; d < D; ++d) 
+        O[q_row * D + d] = acc[d] / l_prev;
 }
 
 

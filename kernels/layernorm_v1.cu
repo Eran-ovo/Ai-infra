@@ -5,14 +5,16 @@
 
 //输入x是一个二维矩阵，大小为B*N，B是batch size，N是每个样本的特征数
 //每个block处理一行数据，block内做两次归约：求均值 -> 求方差
-//归一化公式：y=(x-mean)/sqrt(var+eps) var: 方差
+//归一化公式：y=(x-mean)/sqrt(var+eps) var: 方差 eps: 防止除0
 __global__ void layernorm_fused(const float* __restrict__ x, float* __restrict__ y, int N, float eps){
     int row=blockIdx.x;//该block要处理的行号
     const float* rx=x+row*N;//该线程要处理的数据的起始地址
     float* ry=y+row*N;//该线程要保存的数据的起始地址
     __shared__ float s[BLOCK]; 
     int tid=threadIdx.x;
-    float v=(tid<N)?rx[tid]:0; 
+    float v=0;
+    for(int idx=tid;idx<N;idx+=BLOCK) 
+        v+=rx[idx];
     s[tid]=v; //存放每个线程处理的元素，若线程数大于N，则赋值为0
     __syncthreads();
     //归约求sum，得到32个线程（warp）的结果
@@ -31,8 +33,13 @@ __global__ void layernorm_fused(const float* __restrict__ x, float* __restrict__
     __syncthreads();
     float mean=s[0]/N;
     //计算方差
-    float diff=(tid<N)?rx[tid]-mean:0; 
-    s[tid]=diff*diff; 
+    float sum_sq = 0;
+    for(int idx=tid; idx<N; idx+=BLOCK) {
+        float d = rx[idx] - mean;
+        ry[idx] = d;           // 暂存差值
+        sum_sq += d * d;       // 每线程累加自己那几份的平方和
+    }
+    s[tid] = sum_sq;           // 再块归约
     __syncthreads();
     for(int s2=BLOCK/2; s2>32; s2>>=1){ 
         if(tid<s2) 
@@ -49,8 +56,10 @@ __global__ void layernorm_fused(const float* __restrict__ x, float* __restrict__
     __syncthreads();
     float var=s[0]/N; 
     float inv=rsqrtf(var+eps);//计算标准差的倒数
-    if(tid<N) 
-        ry[tid]=diff*inv;//归一化，得到最终结果
+
+    for(int idx=tid;idx<N;idx+=BLOCK) {
+        ry[idx]*=inv; //归一化
+    }
 }
 int main(){
     int B=1024,N=1024; 
