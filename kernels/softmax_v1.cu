@@ -19,7 +19,7 @@ __global__ void softmax_fused(const float* __restrict__ x, float* __restrict__ y
     sdata[tid] = v; //存放每个线程处理的元素，若线程数大于N，则赋值为一个很小的数
     __syncthreads();//此时共享内存sdata存放了每个线程处理的元素的局部max
     //归约求max，得到32个线程（warp）的结果
-    for(int s=BLOCK/2; s>32; s>>=1){ //线程数依次减半 256->128->64->32
+    for(int s=BLOCK/2; s>=32; s>>=1){ //线程数依次减半 256->128->64->32
         if(tid < s) 
             sdata[tid]=fmaxf(sdata[tid],sdata[tid+s]); 
         __syncthreads(); 
@@ -28,7 +28,7 @@ __global__ void softmax_fused(const float* __restrict__ x, float* __restrict__ y
     if(tid < 32){
         float val = sdata[tid];
         // 也可以用 __shfl_down_sync 进一步优化，这里先用共享内存直观版
-        for(int s=32; s>0; s>>=1) 
+        for(int s=16; s>0; s>>=1) 
             val = fmaxf(val, __shfl_down_sync(0xffffffff, val, s));
         //得到最终的max值，写回共享内存
         if(tid==0) 
@@ -44,7 +44,7 @@ __global__ void softmax_fused(const float* __restrict__ x, float* __restrict__ y
     sdata[tid]=e; //存在共享内存
     __syncthreads();
     //归约求sum，得到32个线程（warp）的结果
-    for(int s=BLOCK/2; s>32; s>>=1){ 
+    for(int s=BLOCK/2; s>=32; s>>=1){ 
         if(tid < s) 
             sdata[tid]+=sdata[tid+s]; 
         __syncthreads(); 
@@ -52,7 +52,7 @@ __global__ void softmax_fused(const float* __restrict__ x, float* __restrict__ y
     //在warp内用shuffle，无需__syncthreads（__syncthreads太慢）
     if(tid<32){ 
         float val=sdata[tid]; 
-        for(int s=32;s>0;s>>=1) 
+        for(int s=16;s>0;s>>=1) 
             val+=__shfl_down_sync(0xffffffff,val,s); 
         //得到最终的sum值，写回共享内存
         if(tid==0)
@@ -68,12 +68,32 @@ __global__ void softmax_fused(const float* __restrict__ x, float* __restrict__ y
         }
     }
 }
+
+static void softmax_cpu(const float* x, float* y, int B, int N){
+    for(int b=0;b<B;++b){
+        const float* row_x=x+b*N;
+        float* row_y=y+b*N;
+        //求max
+        float row_max=-1e20f;
+        for(int i=0;i<N;++i) 
+            row_max=fmaxf(row_max,row_x[i]);
+        //求sum(exp(x-max))
+        float row_sum=0;
+        for(int i=0;i<N;++i) 
+            row_sum+=expf(row_x[i]-row_max);
+        //写回
+        for(int i=0;i<N;++i) 
+            row_y[i]=expf(row_x[i]-row_max)/row_sum;
+    }
+}
+
 int main(){
     int B=1024,N=1024; // 模拟LLM 1024个token, dim 1024
     size_t bytes=B*N*sizeof(float);
-    float *hX=(float*)malloc(bytes),*hY=(float*)malloc(bytes);
+    float *hX=(float*)malloc(bytes),*hY=(float*)malloc(bytes),*hRef=(float*)malloc(bytes);
     for(int i=0;i<B*N;++i) 
         hX[i]= (rand()%100)/10.0f;
+    softmax_cpu(hX,hRef,B,N); // CPU参考实现
     float *dX,*dY;
     cudaMalloc(&dX,bytes);
     cudaMalloc(&dY,bytes);
@@ -94,7 +114,18 @@ int main(){
     cudaEventElapsedTime(&ms,s,e); 
     ms/=100;
     std::cout<<"Softmax Fused B=1024 N=1024: "<<ms<<" ms "<<std::endl;
+    //对拍
     cudaMemcpy(hY,dY,bytes,cudaMemcpyDeviceToHost);
-    std::cout<<"PASS! Sample y[0]="<<hY[0]<<std::endl;
+    float err=0.0f;
+    for(int i=0;i<B*N;++i){
+        err = fmaxf(err, fabs(hY[i] - hRef[i]));
+    }
+    std::cout << (err < 1e-3 ? "PASS!" : "FAIL!") << " maxErr=" << err
+              << " Sample y[0]=" << hY[0] << " Ref=" << hRef[0] << std::endl;    
+    cudaFree(dX);
+    cudaFree(dY);
+    free(hX);
+    free(hY);
+    free(hRef);          
     return 0;
 }

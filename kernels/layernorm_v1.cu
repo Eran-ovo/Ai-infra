@@ -18,14 +18,14 @@ __global__ void layernorm_fused(const float* __restrict__ x, float* __restrict__
     s[tid]=v; //存放每个线程处理的元素，若线程数大于N，则赋值为0
     __syncthreads();
     //归约求sum，得到32个线程（warp）的结果
-    for(int s2=BLOCK/2; s2>32; s2>>=1){ 
+    for(int s2=BLOCK/2; s2>=32; s2>>=1){ 
         if(tid<s2) 
             s[tid]+=s[tid+s2]; 
         __syncthreads(); 
     }
     if(tid<32){ 
         float val=s[tid]; 
-        for(int s2=32;s2>0;s2>>=1) 
+        for(int s2=16;s2>0;s2>>=1) 
             val+=__shfl_down_sync(0xffffffff,val,s2); 
         if(tid==0)
             s[0]=val; 
@@ -41,14 +41,14 @@ __global__ void layernorm_fused(const float* __restrict__ x, float* __restrict__
     }
     s[tid] = sum_sq;           // 再块归约
     __syncthreads();
-    for(int s2=BLOCK/2; s2>32; s2>>=1){ 
+    for(int s2=BLOCK/2; s2>=32; s2>>=1){ 
         if(tid<s2) 
             s[tid]+=s[tid+s2]; 
         __syncthreads(); 
     }
     if(tid<32){ 
         float val=s[tid]; 
-        for(int s2=32;s2>0;s2>>=1) 
+        for(int s2=16;s2>0;s2>>=1) 
             val+=__shfl_down_sync(0xffffffff,val,s2); 
         if(tid==0)
             s[0]=val; 
@@ -61,13 +61,34 @@ __global__ void layernorm_fused(const float* __restrict__ x, float* __restrict__
         ry[idx]*=inv; //归一化
     }
 }
+
+static void layernorm_cpu(const float* x, float* y, int B, int N, float eps){
+    for(int b=0;b<B;++b){
+        const float* rx=x+b*N;
+        float* ry=y+b*N;
+        float sum=0;
+        for(int i=0;i<N;++i) sum+=rx[i];
+        float mean=sum/N;
+        float sum_sq=0;
+        for(int i=0;i<N;++i){
+            float d=rx[i]-mean;
+            ry[i]=d; //暂存差值
+            sum_sq+=d*d;
+        }
+        float var=sum_sq/N;
+        float inv=1.0f/sqrtf(var+eps);
+        for(int i=0;i<N;++i) ry[i]*=inv; //归一化
+    }
+}
+
 int main(){
     int B=1024,N=1024; 
     float eps=1e-5; 
     size_t bytes=B*N*sizeof(float);
-    float *hX=(float*)malloc(bytes),*hY=(float*)malloc(bytes);
+    float *hX=(float*)malloc(bytes),*hY=(float*)malloc(bytes),*hRef=(float*)malloc(bytes);
     for(int i=0;i<B*N;++i) 
         hX[i]= (rand()%100)/10.0f;
+    layernorm_cpu(hX,hRef,B,N,eps); // CPU参考实现
     float *dX,*dY; 
     cudaMalloc(&dX,bytes);
     cudaMalloc(&dY,bytes);
@@ -87,6 +108,16 @@ int main(){
     ms/=100;
     std::cout<<"LayerNorm Fused 1024x1024: "<<ms<<" ms"<<std::endl;
     cudaMemcpy(hY,dY,bytes,cudaMemcpyDeviceToHost); 
-    std::cout<<"PASS! Sample y[0]="<<hY[0]<<std::endl;
+    float err=0.0f;
+    for(int i=0;i<B*N;++i){
+        err = fmaxf(err, fabs(hY[i] - hRef[i]));
+    }
+    std::cout << (err < 1e-3 ? "PASS!" : "FAIL!") << " maxErr=" << err
+              << " Sample y[0]=" << hY[0] << " Ref=" << hRef[0] << std::endl;
+    cudaFree(dX);
+    cudaFree(dY);
+    free(hX);
+    free(hY);
+    free(hRef);          
     return 0;
 }
