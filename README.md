@@ -41,7 +41,7 @@ nvcc -O3 -I/home/eran/cutlass/include kernels/gemm_v3_cutlass.cu -o benchmarks/g
 | LayerNorm | v1 Fused（两次归约求均值/方差） | 1024 x 1024 | 0.030 ms | - | PASS (maxErr=4.5e-06) |
 | RMSNorm | v1 Fused（LLaMA 标配，一次归约） | 1024 x 1024 | 0.031 ms | - | PASS (maxErr=1.7e-06) |
 | FlashAttention | v1（分块 + Online Softmax，S 矩阵不落地 HBM） | N=512, D=64, Br/Bc=32 | 0.199 ms | - | PASS (maxErr=2.4e-07) |
-| FlashAttention | v2（v1 + causal mask，模板双模式） | N=8192, D=64, Br=32 | full 9.43 / causal 4.71 ms | 2.00x | PASS (maxErr=6.4e-07) |
+| FlashAttention | v2（v1 + causal mask，模板双模式） | N=8192, D=64, Br=256 | full 9.43 / causal 4.71 ms | 2.00x | PASS (maxErr=6.4e-07) |
 | FlashAttention | v3（一 warp 一行 + smem padding 消 bank conflict） | N=8192, D=64, Br=256 | full 17.7 / causal 8.8 ms | 2.01x | PASS (maxErr=2.4e-07) |
 
 > 注：WSL2 下 GPU 频率有波动，数据为多轮运行的代表值；GEMM 计时为 20 次平均，Softmax/LayerNorm/RMSNorm/FlashAttention 为 100 次平均（均含预热）。
@@ -75,7 +75,7 @@ v3 把"一线程一行"改成"一 warp 一行"（FA2 的重划分思想），每
 | 加 padding | **17.7 ms** | bank conflict 0.67 亿（-14x） | `Ktile/Vtile[Bc][D+1]`，步长 65 与 32 互质 |
 
 **v3 仍比 v2（9.7ms）慢 1.8x 的归因**：
-1. **K/V 重复搬运**：block 数 256→1024（每 block Q 行 32→8），每 block 仍搬全量 K/V，DRAM 读取 +50%（被 L2 缓存摊薄）
+1. **K/V 重复搬运**：block 数 32→1024（每 block Q 行 256→8），每 block 仍搬全量 K/V，DRAM 读取 增加（被 L2 缓存摊薄）
 2. **bank conflict**（已修复，贡献 1.9x 提速）
 3. **Q 点积冗余**：每 lane 对同一行 Q 独立算 64 维点积，算术量高于 v2
 4. **shuffle 广播**：4e 权重收集的额外开销

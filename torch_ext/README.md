@@ -1,0 +1,76 @@
+# torch_ext：把手写 CUDA kernel 封装成 PyTorch 算子
+
+把 `kernels/` 下 5 个手写 CUDA kernel（GEMM / Softmax / LayerNorm / RMSNorm / FlashAttention）统一封装成一个 PyTorch Extension 模块 `ai_infra_ops`，工业界标准的 CUDA → PyTorch 封装流程。
+
+## 环境
+
+```bash
+# 隔离 venv（不污染系统 Python）
+python3 -m venv ~/venvs/torch
+~/venvs/torch/bin/pip install torch --index-url https://download.pytorch.org/whl/cu124
+~/venvs/torch/bin/pip install numpy ninja
+```
+
+## 编译 & 运行
+
+```bash
+cd torch_ext
+export PATH=/usr/local/cuda/bin:$PATH
+export TORCH_CUDA_ARCH_LIST="8.6"   # RTX 3060 Laptop = Ampere sm_86
+~/venvs/torch/bin/python setup.py build_ext --inplace
+~/venvs/torch/bin/python test_all.py
+```
+
+## API
+
+```python
+import ai_infra_ops
+
+ai_infra_ops.rmsnorm(x, g, eps)          # x [B,N] fp32, g [N]
+ai_infra_ops.softmax(x)                  # x [B,N] fp32，沿 axis=-1
+ai_infra_ops.layernorm(x, eps)           # x [B,N] fp32，无 affine
+ai_infra_ops.gemm(a, b)                  # a [M,K] b [K,N] fp32 -> [M,N]
+ai_infra_ops.flashattention(q, k, v, causal)  # q/k/v [N,64] fp32
+```
+
+## 实测结果（RTX 3060 Laptop，同会话交错计时，test_all.py 复现）
+
+| 算子 | 手写 CUDA | PyTorch 原生 | 加速比 |
+|------|----------|-------------|--------|
+| RMSNorm (B=1024 N=1024) | 0.031 ms | 0.156 ms | 4.97x |
+| Softmax (B=1024 N=1024) | 0.031 ms | 0.030 ms | 0.98x |
+| LayerNorm (B=1024 N=1024) | 0.040 ms | 0.125 ms | 3.11x |
+| GEMM (1024^3) | 3.04 ms | 0.33 ms (cuBLAS) | 0.11x |
+| FlashAttention (N=8192 D=64) | causal 9.95 ms | - | causal 提速 2.06x |
+
+### 为什么是这个结果
+
+- **归一化类（RMSNorm/LayerNorm）」融合是最大卖点**：PyTorch 原生把它拆成 pow→mean→rsqrt→mul 多个 kernel，中间结果反复写回显存；fused 一次加载一次写回，3-5x。
+- **Softmax 0.98x 不丢人**：B=N=1024 时 torch.softmax 本身已是单个融合 kernel，打平合理；换非 2 的幂 N 或更大 batch，线程粗化版通常反超。
+- **GEMM 0.11x 是诚实的差距展示**：v2 tiled 手写 vs cuBLAS 差 9 倍——cuBLAS 用 Tensor Core + 深度流水线。这正是路线 B（FP16 + mma.sync）的动机，也是"知道轮子多快"和"会造轮子"都要会的证据。
+
+## 文件结构
+
+```
+torch_ext/
+├── csrc/
+│   ├── bindings.cpp           # PyBind11 绑定：统一暴露 5 个 forward
+│   ├── ops.h                  # 入口函数声明
+│   ├── rmsnorm_cuda.cu        # 各算子：CUDA kernel + torch::Tensor 包装
+│   ├── softmax_cuda.cu
+│   ├── layernorm_cuda.cu
+│   ├── gemm_cuda.cu
+│   └── flashattention_cuda.cu
+├── setup.py                   # CUDAExtension 单模块构建
+└── test_all.py                # 正确性对拍 + 性能 benchmark
+```
+
+## 关键点（面试常问）
+
+1. **数据校验**：`TORCH_CHECK` 检查 device / dtype / contiguous / 维度，防御性编程
+2. **contiguous**：`is_contiguous()` 保证内存连续，kernel 才能用 `x + row*N` 定位
+3. **data_ptr<T>()**：拿到 tensor 裸指针传给 kernel
+4. **单一模块 vs 多 .so**：一个 `ai_infra_ops` 暴露 5 个算子，避免每个算子一个共享库——工业界（如 FlashAttention 官方 repo、DeepSpeed op）都这么做
+5. **运行时 bool → 编译期模板**：FlashAttention 的 causal 是运行时 bool，在包装层 `if/else` 派发到 `flash_fwd<true>` / `flash_fwd<false>` 两个编译期实例，消除 kernel 内每轮循环的运行时分支
+6. **ABI 一致**：setup.py 编译时 torch 自动对齐 `_GLIBCXX_USE_CXX11_ABI`
+7. **TORCH_CUDA_ARCH_LIST**：指定 sm_86，避免对所有架构编译浪费时间
