@@ -7,7 +7,7 @@
 // 尺寸：Q/K/V 都是 N x D。每个 Block 负责 Br 行 Q，每次搬 Bc 行 K/V 进 SRAM。
 // 中间 S = Br x Bc 只在寄存器/Shared 里算完即扔，永不落地 HBM。
 // ---------------------------------------------------------------------------
-#define Br 32   // 每 Block 处理 256 行 Q（一线程一行）
+#define Br 256   // 每 Block 处理 256 行 Q（一线程一行）
 #define Bc 32   // 每轮搬 32 行 K/V
 #define D  64   // 每行向量维度
 
@@ -245,7 +245,3 @@ int main() {
     free(hQ); free(hK); free(hV); free(hO); free(hRef); free(hRefC);
     return 0;
 }
-/*
-当Br=32，N=512时，输出：
-
-*/

@@ -42,6 +42,7 @@ nvcc -O3 -I/home/eran/cutlass/include kernels/gemm_v3_cutlass.cu -o benchmarks/g
 | RMSNorm | v1 Fused（LLaMA 标配，一次归约） | 1024 x 1024 | 0.031 ms | - | PASS (maxErr=1.7e-06) |
 | FlashAttention | v1（分块 + Online Softmax，S 矩阵不落地 HBM） | N=512, D=64, Br/Bc=32 | 0.199 ms | - | PASS (maxErr=2.4e-07) |
 | FlashAttention | v2（v1 + causal mask，模板双模式） | N=8192, D=64, Br=32 | full 9.43 / causal 4.71 ms | 2.00x | PASS (maxErr=6.4e-07) |
+| FlashAttention | v3（一 warp 一行重划分，occupancy 2%→79%） | N=8192, D=64, Br=256 | full 33.3 / causal 16.1 ms | 2.07x | PASS (maxErr=2.4e-07) |
 
 > 注：WSL2 下 GPU 频率有波动，数据为多轮运行的代表值；GEMM 计时为 20 次平均，Softmax/LayerNorm/RMSNorm/FlashAttention 为 100 次平均（均含预热）。
 
@@ -74,3 +75,4 @@ Occupancy     2.08%     2.08%    ← 每 block 仅 1 warp，SM 大量空转
 - **rmsnorm_v1**: LLaMA/Qwen 标配的 RMSNorm。相比 LayerNorm 去掉 centering（减均值），只需一次归约（Σx²），且省一次全局显存读写。
 - **flashattention_v1**: FlashAttention 前向。Q 行驻留寄存器，K/V 按块搬入 Shared Memory，维护 running max / sum / acc 做 Online Softmax，中间 S 矩阵永不写回 HBM。
 - **flashattention_v2**: v1 + causal mask（GPT 自回归必备）。`template<bool IS_CAUSAL>` 编译期双模式零开销；kv 循环上界按 block 粒度截断（`q_row_max/Bc+1`）整块跳过未来信息，对角线块逐元素 mask；N=8192 时 causal 达 2.00x 理论加速。
+- **flashattention_v3**: FA2 的核心重划分——一 warp 一行 Q（v2 是一线程一行）。每 lane 只存 DQ=D/32=2 维（`q_reg[2]+acc[2]`），寄存器 255→40/thread，occupancy 2%→79%。点积改为每 lane 对共享 Q 行独立算完整 dot（避开 causal 分支下 shuffle 死锁）；S 分数由 lane i 负责第 i 个（Bc=WARP=32）。⚠️ 教训：v3 结构正确但比 v2 慢 3.4x（33 vs 9.7ms）——Q 点积冗余 32 倍 + shuffle 开销，说明 occupancy 不是唯一指标，**算术强度**同样关键。
