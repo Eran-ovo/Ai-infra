@@ -42,7 +42,7 @@ nvcc -O3 -I/home/eran/cutlass/include kernels/gemm_v3_cutlass.cu -o benchmarks/g
 | RMSNorm | v1 Fused（LLaMA 标配，一次归约） | 1024 x 1024 | 0.031 ms | - | PASS (maxErr=1.7e-06) |
 | FlashAttention | v1（分块 + Online Softmax，S 矩阵不落地 HBM） | N=512, D=64, Br/Bc=32 | 0.199 ms | - | PASS (maxErr=2.4e-07) |
 | FlashAttention | v2（v1 + causal mask，模板双模式） | N=8192, D=64, Br=32 | full 9.43 / causal 4.71 ms | 2.00x | PASS (maxErr=6.4e-07) |
-| FlashAttention | v3（一 warp 一行重划分，occupancy 2%→79%） | N=8192, D=64, Br=256 | full 33.3 / causal 16.1 ms | 2.07x | PASS (maxErr=2.4e-07) |
+| FlashAttention | v3（一 warp 一行 + smem padding 消 bank conflict） | N=8192, D=64, Br=256 | full 17.7 / causal 8.8 ms | 2.01x | PASS (maxErr=2.4e-07) |
 
 > 注：WSL2 下 GPU 频率有波动，数据为多轮运行的代表值；GEMM 计时为 20 次平均，Softmax/LayerNorm/RMSNorm/FlashAttention 为 100 次平均（均含预热）。
 
@@ -64,6 +64,24 @@ Occupancy     2.08%     2.08%    ← 每 block 仅 1 warp，SM 大量空转
 
 **教训**：① 低 occupancy 下谈计算量优化是空中楼阁，先解决延迟隐藏；② 性能对比必须同会话交错测量，WSL2 频率波动可制造 ±50% 假象。
 
+**FlashAttention v3（warp-per-row）调优三部曲**（2026-09-06/07）：
+
+v3 把"一线程一行"改成"一 warp 一行"（FA2 的重划分思想），每 lane 只存 `D/32=2` 维。过程中踩了三个坑，逐个定位：
+
+| 阶段 | full 耗时 | 关键指标 | 问题 |
+|------|----------|---------|------|
+| 初版 | 死锁 / FAIL | - | causal 分支发散下用 `__shfl_xor` 归约 → 死锁；`q_row>=N` 提前 return → `__syncthreads` 死锁 |
+| 修死锁 | 33.3 ms | occupancy 79%，bank conflict 9.4 亿 | Q 入 smem + 每 lane 独立点积解决发散；但 K/V 列访问 32 路 bank conflict |
+| 加 padding | **17.7 ms** | bank conflict 0.67 亿（-14x） | `Ktile/Vtile[Bc][D+1]`，步长 65 与 32 互质 |
+
+**v3 仍比 v2（9.7ms）慢 1.8x 的归因**：
+1. **K/V 重复搬运**：block 数 256→1024（每 block Q 行 32→8），每 block 仍搬全量 K/V，DRAM 读取 +50%（被 L2 缓存摊薄）
+2. **bank conflict**（已修复，贡献 1.9x 提速）
+3. **Q 点积冗余**：每 lane 对同一行 Q 独立算 64 维点积，算术量高于 v2
+4. **shuffle 广播**：4e 权重收集的额外开销
+
+**教训**：① occupancy、搬运量、算术强度是三角债，拉满一个可能拖累另一个，优化是找平衡点；② shared memory 列访问必查 bank conflict（步长是 32 倍数时全撞）；③ 发散分支里禁用跨 lane shuffle，会死锁。
+
 ## 实现要点
 
 - **gemm_v0**: PMPP 第 5 章朴素实现，一个线程算 C 的一个元素，全程走全局内存。
@@ -75,4 +93,4 @@ Occupancy     2.08%     2.08%    ← 每 block 仅 1 warp，SM 大量空转
 - **rmsnorm_v1**: LLaMA/Qwen 标配的 RMSNorm。相比 LayerNorm 去掉 centering（减均值），只需一次归约（Σx²），且省一次全局显存读写。
 - **flashattention_v1**: FlashAttention 前向。Q 行驻留寄存器，K/V 按块搬入 Shared Memory，维护 running max / sum / acc 做 Online Softmax，中间 S 矩阵永不写回 HBM。
 - **flashattention_v2**: v1 + causal mask（GPT 自回归必备）。`template<bool IS_CAUSAL>` 编译期双模式零开销；kv 循环上界按 block 粒度截断（`q_row_max/Bc+1`）整块跳过未来信息，对角线块逐元素 mask；N=8192 时 causal 达 2.00x 理论加速。
-- **flashattention_v3**: FA2 的核心重划分——一 warp 一行 Q（v2 是一线程一行）。每 lane 只存 DQ=D/32=2 维（`q_reg[2]+acc[2]`），寄存器 255→40/thread，occupancy 2%→79%。点积改为每 lane 对共享 Q 行独立算完整 dot（避开 causal 分支下 shuffle 死锁）；S 分数由 lane i 负责第 i 个（Bc=WARP=32）。⚠️ 教训：v3 结构正确但比 v2 慢 3.4x（33 vs 9.7ms）——Q 点积冗余 32 倍 + shuffle 开销，说明 occupancy 不是唯一指标，**算术强度**同样关键。
+- **flashattention_v3**: FA2 的核心重划分——一 warp 一行 Q（v2 是一线程一行）。每 lane 只存 DQ=D/32=2 维（`q_reg[2]+acc[2]`），寄存器 255→40/thread，occupancy 2%→79%。Q 行入 smem，每 lane 独立算完整点积（避开 causal 分支下 shuffle 死锁）；`Ktile/Vtile[Bc][D+1]` padding 消除列访问的 32 路 bank conflict（提速 1.9x）。仍比 v2 慢 1.8x：K/V 随 block 数增多而重复搬运 + Q 点积冗余，说明 occupancy 与算术强度需平衡。

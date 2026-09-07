@@ -43,13 +43,18 @@ __global__ void flash_fwd(const float* __restrict__ Q,
     const bool valid = (q_row < N);
 
     // --- SRAM：全 block 共享的 K/V 块 + Q 行 --------------------------------
-    __shared__ float Ktile[Bc][D];     // 32x64 = 8KB
-    __shared__ float Vtile[Bc][D];     // 32x64 = 8KB
+    // 【bank conflict 修复】Ktile/Vtile 按 [c][d] 行主序存储，4b/4e 中 warp 内
+    // 32 个 lane 用不同 c、相同 d 访问 -> 地址间隔 D 个 float，D=64 是 32 的倍数
+    // -> 全撞同一 bank（32 路冲突，ncu 实测每条 load ~7 次冲突）。
+    // 经典解法：每行 +1 float padding，步长变 D+1=65（与 32 互质），冲突消除。
+    // Qtile 不用 pad：4b 中全 warp 读同一地址 Qtile[warp_id][d]，走广播无冲突。
+    __shared__ float Ktile[Bc][D+1];   // 32x65
+    __shared__ float Vtile[Bc][D+1];   // 32x65
     __shared__ float Qtile[ROWS_PER_BLK][D];  // 8x64 = 2KB，本 block 的 8 行 Q
 
     // Q 行一次性协作搬入 smem（block 内统一循环，无发散；越界行补零陪跑）
-    for (int idx = tid; idx < ROWS_PER_BLK * D; idx += Br) {
-        const int r = idx / D, d = idx % D;
+    for (int i = lane*DQ; i < lane*DQ + DQ; i ++) {
+        const int r = warp_id, d = i;
         const int qr = q_blk * ROWS_PER_BLK + r;
         Qtile[r][d] = (qr < N) ? Q[qr * D + d] : 0.0f;
     }
@@ -64,6 +69,8 @@ __global__ void flash_fwd(const float* __restrict__ Q,
     // causal 块级截断：本 block 最大行号 q_blk*ROWS_PER_BLK + ROWS_PER_BLK-1
     // 它需要的最右 kv 块 = q_row_max / Bc + 1（全 block 一致，不拖 syncthreads）
     const int q_row_max = q_blk * ROWS_PER_BLK + ROWS_PER_BLK - 1;
+    //当Bv_blk*Bc > q_row_max时，说明后续的kv块对本block的q行没有贡献，可以提前结束循环
+    //所以kv_end = IS_CAUSAL ? (q_row_max / Bc + 1) : num_kv_blks;
     const int kv_end = IS_CAUSAL ? (q_row_max / Bc + 1) : num_kv_blks;
 
     for (int kv_blk = 0; kv_blk < kv_end; ++kv_blk) {
@@ -84,7 +91,7 @@ __global__ void flash_fwd(const float* __restrict__ Q,
         //      每个 lane 得到的是 32 行 K 的混合值而非自己那行的 dot；且该
         //      shuffle 在 causal mask 下发散使用会直接死锁。）
         float S = -1e20f;
-        const int kv_col = kv_blk * Bc + lane;
+        const int kv_col = kv_blk * Bc + lane;//warp内一个线程算一个分数，kv_col是该线程对应的K行号
         // 越界 warp（valid=false）不参与计算，S 保持 -1e20 -> p=0，不影响归约
         bool visible = valid && (!IS_CAUSAL || kv_col <= q_row) && (kv_col < N);
         if (visible) {
