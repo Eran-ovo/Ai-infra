@@ -37,10 +37,9 @@ nvcc -O3 -I/home/eran/cutlass/include kernels/gemm_v3_cutlass.cu -o benchmarks/g
 | GEMM | v1 Shared Memory Tiling（32x32，无 Bank Conflict） | 1024³ | 2.77 ms | 779 GFLOPS | PASS |
 | GEMM | v2 Coalesced + `__ldg` 只读缓存 | 1024³ | 2.72 ms | 789 GFLOPS | PASS |
 | GEMM | v3 CUTLASS 工业级实现（编译期固化 tile/warp/流水线） | 1024³ | 0.408 ms | 5259 GFLOPS | PASS |
-| GEMM | v4 手写 Tensor Core（fp16 + mma.sync.m16n8k16） | 4096³ | 25.9 ms | 5292 GFLOPS | PASS (relErr=2.4e-05) |
-| GEMM | v4 手写 Tensor Core（fp16 输入，`mma.sync.m16n8k16`，fp32 累加） | 1024³ | 0.448 ms | ~4800 GFLOPS | PASS (relErr 7.4e-6) |
-| GEMM | v4 手写 Tensor Core | 2048³ | 3.66 ms | ~4700 GFLOPS | PASS (relErr 1.3e-5) |
-| GEMM | v4 手写 Tensor Core | 4096³ | 26.0 ms | ~5300 GFLOPS | PASS (relErr 2.4e-5) |
+| GEMM | v4 手写 Tensor Core（fp16 输入 + `mma.sync.m16n8k16`，fp32 累加） | 1024³ | 0.542 ms | 3963 GFLOPS | PASS |
+| GEMM | v4 手写 Tensor Core（同上） | 2048³ | 3.889 ms | 4417 GFLOPS | PASS |
+| GEMM | v4 手写 Tensor Core（同上） | 4096³ | 26.532 ms | 5180 GFLOPS | PASS |
 | Softmax | v1 Fused（线程粗化 + 树形归约 + warp shuffle） | 1024 x 1024 | 0.046 ms | - | PASS (maxErr=1.7e-08) |
 | LayerNorm | v1 Fused（两次归约求均值/方差） | 1024 x 1024 | 0.030 ms | - | PASS (maxErr=4.5e-06) |
 | RMSNorm | v1 Fused（LLaMA 标配，一次归约） | 1024 x 1024 | 0.031 ms | - | PASS (maxErr=1.7e-06) |
@@ -48,7 +47,7 @@ nvcc -O3 -I/home/eran/cutlass/include kernels/gemm_v3_cutlass.cu -o benchmarks/g
 | FlashAttention | v2（v1 + causal mask，模板双模式） | N=8192, D=64, Br=256 | full 9.43 / causal 4.71 ms | 2.00x | PASS (maxErr=6.4e-07) |
 | FlashAttention | v3（一 warp 一行 + smem padding 消 bank conflict） | N=8192, D=64, Br=256 | full 17.7 / causal 8.8 ms | 2.01x | PASS (maxErr=2.4e-07) |
 
-> 注：WSL2 下 GPU 频率有波动，数据为多轮运行的代表值；GEMM 计时为 20 次平均，Softmax/LayerNorm/RMSNorm/FlashAttention 为 100 次平均（均含预热）。
+> 注：WSL2 下 GPU 频率有波动，数据为多轮运行的代表值；GEMM v0-v3 为 20 次平均，GEMM v4 为 50 轮平均（bench_avg.py，pytorch 算子，含预热），Softmax/LayerNorm/RMSNorm/FlashAttention 为 100 次平均（均含预热）。
 
 ## 调优实战记录（ncu 性能分析）
 
@@ -88,7 +87,7 @@ v3 把"一线程一行"改成"一 warp 一行"（FA2 的重划分思想），每
 
 **GEMM v4 手写 Tensor Core（fp16 mma.sync）**（2026-09-08）：
 
-v2 的 fp32 FMA 版只有 ~40 GFLOPS，v4 换成手写 `mma.sync.aligned.m16n8k16.row.col` 后直接冲到 **~4.8-5.3 TFLOPS，100x+ 跃升**，与 cuBLAS 的差距从 ~250x 缩到 ~4x。核心差异：FMA 是「每周期 32 个 lane 各 1 次乘加」，mma 是「每条指令整个 warp 算完 16×8×16=2048 次乘加」。
+v2 的 fp32 FMA 版在 1024³ 是 789 GFLOPS，v4 换成手写 `mma.sync.aligned.m16n8k16.row.col` 后单次实测 2847（1024³）/ 3620（2048³）/ 4322（4096³）GFLOPS，20 次平均 ~4800 GFLOPS——算力提升约 4-6x，与 cuBLAS（torch.matmul fp16）的差距约 2-4x。核心差异：FMA 是「每周期 32 个 lane 各 1 次乘加」，mma 是「每条指令整个 warp 算完 16×8×16=2048 次乘加」。
 
 **数据流**：`global fp16 A/B → smem tile → fragment(寄存器) → mma.sync → fp32 acc → global C`。为什么要先过 smem：fragment 布局是「乱序」的（每个 lane 读 `(g, 2*gid)` 这种跳变位置），直接从 global 读会打散合并访存；先用 256 线程按 `tid, tid+256...` 顺序接力搬进 smem（coalesced），再从 smem 按 fragment 布局自由索引（bank 带宽高、代价小）。
 
@@ -102,7 +101,9 @@ v2 的 fp32 FMA 版只有 ~40 GFLOPS，v4 换成手写 `mma.sync.aligned.m16n8k1
 
 **踩坑**：A fragment 的 a1/a2 行索引写反 → **rows 16-63 输出全 0、前 16 行正确**（后 8 行 A 被当前 8 行用，矩阵错位）——**前 16 行对、后 48 行错的不均匀错位（而非全错）是 fragment 映射 bug 的标志**。定位手法：单 block + A=单位阵 + B=行号的确定性用例，一列 dump 出错误模式，一眼定位是哪半块错位。另：CPU 对拍必须和 GPU 吃**同一份 fp16 量化后的输入**（否则 0.2/0.4 这类无法精确表示的值会让两边基准不同、误报 FAIL），阈值用**相对误差**而非绝对误差（fp16 GEMM 的绝对误差随 K 线性增长）。
 
-**性能解释**：2048 比 1024 慢 **8 倍**是健康的线性扩展（工作量 2·M·N·K ∝ D³），判断标准看 **GFLOPS 是否持平**（实测 1024→2048→4096 为 4.8→4.7→5.3 TFLOPS，持平即健康）。若超出 8 倍（GFLOPS 塌陷）则是笔记本 GPU 撞 TDP/温度墙降频——判定铁证是同一进程里 **cuBLAS 也按同比例变慢**（cuBLAS 不受我们的 kernel 影响）。
+**性能解释**：2048 比 1024 慢 **8 倍**是健康的线性扩展（工作量 2·M·N·K ∝ D³），判断标准看 **GFLOPS 是否持平**（实测 1024→2048→4096 为 2847→3620→4322 GFLOPS 单次、~4800 20 次平均，大尺寸反而略升，持平即健康）。若超出 8 倍（GFLOPS 塌陷）则是笔记本 GPU 撞 TDP/温度墙降频——判定铁证是同一进程里 **cuBLAS 也按同比例变慢**（cuBLAS 不受我们的 kernel 影响）。
+
+**测量口径差异（重要）**：单次计时 vs 多次平均差明显。1024³ 单次 0.754ms（2847 GFLOPS）但 20 次平均 0.448ms（4800 GFLOPS）——首轮 kernel 启动有上下文/冷缓存/未达稳态频率的开销。同尺寸下两种口径都记录，避免"到底多少 GFLOPS"的歧义。另：`gemm_mma` 是 fp32 累加，`torch.matmul` 对 fp16 输入默认 fp16 累加（更快但不精确），故 cuBLAS 对照值偏乐观；公平对比应看 .cu 里 `cublasGemmEx` 的 fp16-in/fp32-out（~10.3 TFLOPS）。
 
 
 ## 实现要点
@@ -111,7 +112,7 @@ v2 的 fp32 FMA 版只有 ~40 GFLOPS，v4 换成手写 `mma.sync.aligned.m16n8k1
 - **gemm_v1**: Shared Memory 分块（TILE=32），`As[ty][k] * Bs[k][tx]` 的访问模式天然无 Bank Conflict（源码注释里附了冲突反例对比）。相对 v0 加速 ~1.3x。
 - **gemm_v2**: 在 v1 已合并访存的基础上，全局加载改用 `__ldg` 走只读缓存 + `__restrict__`。
 - **gemm_v3_cutlass**: 调用 NVIDIA CUTLASS 库的 `cutlass::gemm::device::Gemm`，编译期固化 tile/warp/流水线配置，几乎零运行时开销；相比手写 v2 提速 ~6.5x，展示了工业级库与手写 kernel 的差距。
-- **gemm_v4_mma**: 手写 Tensor Core GEMM——fp16 输入用 `mma.sync.aligned.m16n8k16.row.col` 内联 PTX 指令，绕开 wmma API 与 CUTLASS，亲手管理 fragment 布局 + smem 搬运 + 8-warp 分块。相比 v2 的 fp32 FMA（~40 GFLOPS 量级）直接跃升到 5+ TFLOPS（100x+），与 cuBLAS fp16 差距从 250x 缩到 4x。踩坑见上方"GEMM v4 手写 Tensor Core"调优记录。
+- **gemm_v4_mma**: 手写 Tensor Core GEMM——fp16 输入用 `mma.sync.aligned.m16n8k16.row.col` 内联 PTX 指令，绕开 wmma API 与 CUTLASS，亲手管理 fragment 布局 + smem 搬运 + 8-warp 分块。相比 v2 的 fp32 FMA（789 GFLOPS）跃升到 2.8-4.3 TFLOPS（单次）/ ~4.8 TFLOPS（20 次平均），与 cuBLAS 差距约 2-4x。踩坑见上方"GEMM v4 手写 Tensor Core"调优记录。
 - **softmax_v1**: 数值安全版（减 max）fused softmax；线程粗化（grid-stride）预扫描 + block 内树形归约到 32 个线程后改用 `__shfl_down_sync` warp 内归约，避免 `__syncthreads` 开销。
 - **layernorm_v1**: 一行一 block，线程粗化加载，两次归约（sum → 均值，平方和 → 方差），`rsqrtf(var+eps)` 归一化。
 - **rmsnorm_v1**: LLaMA/Qwen 标配的 RMSNorm。相比 LayerNorm 去掉 centering（减均值），只需一次归约（Σx²），且省一次全局显存读写。

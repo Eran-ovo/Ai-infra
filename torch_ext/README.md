@@ -42,7 +42,9 @@ ai_infra_ops.flashattention(q, k, v, causal)  # q/k/v [N,64] fp32
 | Softmax (B=1024 N=1024) | 0.031 ms | 0.030 ms | 0.98x |
 | LayerNorm (B=1024 N=1024) | 0.040 ms | 0.125 ms | 3.11x |
 | GEMM (1024^3) | 3.04 ms | 0.33 ms (cuBLAS) | 0.11x |
-| GEMM mma fp16 (4096^3) | 23.2 ms | 5.8 ms (cuBLAS fp16) | 0.25x / 23.6 TFLOPS(ref) |
+| GEMM mma fp16 (1024^3) | 0.542 ms | 0.237 ms (cuBLAS fp16) | 0.44x |
+| GEMM mma fp16 (2048^3) | 3.889 ms | 0.867 ms (cuBLAS fp16) | 0.22x |
+| GEMM mma fp16 (4096^3) | 26.532 ms | 6.542 ms (cuBLAS fp16) | 0.25x |
 | FlashAttention (N=8192 D=64) | causal 9.95 ms | - | causal 提速 2.06x |
 
 ### 为什么是这个结果
@@ -50,7 +52,7 @@ ai_infra_ops.flashattention(q, k, v, causal)  # q/k/v [N,64] fp32
 - **归一化类（RMSNorm/LayerNorm）」融合是最大卖点**：PyTorch 原生把它拆成 pow→mean→rsqrt→mul 多个 kernel，中间结果反复写回显存；fused 一次加载一次写回，3-5x。
 - **Softmax 0.98x 不丢人**：B=N=1024 时 torch.softmax 本身已是单个融合 kernel，打平合理；换非 2 的幂 N 或更大 batch，线程粗化版通常反超。
 - **GEMM 0.11x 是诚实的差距展示**：v2 tiled 手写 vs cuBLAS 差 9 倍——cuBLAS 用 Tensor Core + 深度流水线。这正是路线 B（FP16 + mma.sync）的动机，也是"知道轮子多快"和"会造轮子"都要会的证据。
-- **gemm_mma 0.25x 是路线 B 的第一步**：手写 `mma.sync.m16n8k16` 后从 v2 的 ~40 GFLOPS 跃升到 5-6 TFLOPS（100x+），与 cuBLAS 差距从 250x 缩到 4x。剩余 4x 来自无 cp.async 双缓冲 / ldmatrix / 大 tile，是"追平 cuBLAS"的后续迭代点。
+- **gemm_mma 0.22x-0.44x 是路线 B 的第一步**：手写 `mma.sync.m16n8k16` 后，1024³ 从 v2 fp32 的 ~700 GFLOPS 跃升到 3963 GFLOPS（~6x），大尺寸到 5.2 TFLOPS；与 cuBLAS fp16 差距从 ~13x 缩到 2-4x。剩余差距来自无 cp.async 双缓冲 / ldmatrix / 大 tile，是"追平 cuBLAS"的后续迭代点。注：cuBLAS 对比走 `torch.matmul` 的 fp16 累加路径（比 fp32 累加更快），手写版是 fp32 累加，严格同精度对比见 kernels/gemm_v4_mma.cu 的 cublasGemmEx。
 
 ## 文件结构
 
