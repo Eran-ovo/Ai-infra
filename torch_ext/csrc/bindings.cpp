@@ -10,6 +10,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("softmax",        &softmax_forward,        "Softmax forward (CUDA)");
     m.def("layernorm",      &layernorm_forward,      "LayerNorm forward (CUDA，无 affine)");
     m.def("gemm",           &gemm_forward,           "GEMM forward (CUDA, tiled)");
+    m.def("gemm_mma",       &gemm_mma_forward,       "GEMM forward (CUDA, fp16 Tensor Core mma.sync)");
     m.def("flashattention", &flashattention_forward, "FlashAttention forward (CUDA, online softmax)",
           py::arg("q"), py::arg("k"), py::arg("v"), py::arg("causal") = false);
 }

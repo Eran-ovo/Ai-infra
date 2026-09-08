@@ -49,6 +49,11 @@
 - 仓库链接 + 求 star + 邮箱/联系方式
 - 预告：下一篇《把 CUDA kernel 封装成 PyTorch Extension》
 
+### 7. 番外（待写）：Tensor Core 手撕实录（gemm_v4_mma）
+- 从 fp32 FMA 到 `mma.sync.m16n8k16`，性能 40 GFLOPS → 5 TFLOPS（100x+）
+- 两个坑：① A fragment 布局写反 → rows 16-63 全 0（「A=单位阵 dump 全矩阵」定位法）；② CPU 对拍要吃同份 fp16 量化输入，否则 0.2/0.4 的量化误差被误判成 bug
+- 剩余 4x 差距 → cp.async / ldmatrix / 大 tile，预告 flash attention FP16 篇
+
 ## 写作提醒
 - 多用「我以为……结果……」的反转句式，技术博客就爱看踩坑
 - 代码片段别贴整文件，贴关键的 5-10 行 + 逐行注释

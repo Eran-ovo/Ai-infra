@@ -13,6 +13,7 @@ setup(
                 "csrc/softmax_cuda.cu",
                 "csrc/layernorm_cuda.cu",
                 "csrc/gemm_cuda.cu",
+                "csrc/gemm_mma_cuda.cu",       # fp16 Tensor Core GEMM（手写 mma.sync）
                 "csrc/flashattention_cuda.cu",
             ],
             extra_cuda_cflags=["-O3"],
