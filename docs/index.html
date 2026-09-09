@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>cuda-kernels · 算子系统梳理</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <span class="brand">cuda-kernels 文档</span>
+  <nav>
+    <a href="index.html" class="active">总览</a>
+    <a href="gemm.html">GEMM</a>
+    <a href="normalization.html">归约 / 归一化</a>
+    <a href="flashattention.html">FlashAttention</a>
+    <a href="torch_ext.html">PyTorch 封装</a>
+  </nav>
+</header>
+
+<div class="wrap">
+
+  <div class="hero">
+    <h1>算子原理与演进</h1>
+    <p class="sub">RTX 3060 Laptop (sm_86) · CUDA 12.4 · WSL2 —— 每个算子的「为什么这样做」与版本间「差在哪」</p>
+  </div>
+
+  <p>仓库 <code>kernels/</code> 下目前 11 个算子，按<strong>底层数据结构与优化主线</strong>归成三类。
+  同一类共享一段核心原理，版本迭代则是对这条主线上某个瓶颈的逐步填补。</p>
+
+  <div class="grid">
+
+    <div class="card">
+      <span class="kind">矩阵乘 · 5 版</span>
+      <h3>GEMM</h3>
+      <p><strong>主线</strong>：分块复用 + 访存优化，把「每线程算一个 C」逐步升级成「每 warp 用 Tensor Core 算 16×8×16」。</p>
+      <p><strong>覆盖</strong>：gemm_v0 朴素 → v1 smem tiling → v2 ldg 只读缓存 → v3 CUTLASS → v4 手写 mma.sync</p>
+      <a class="more" href="gemm.html">详读原理与区别 →</a>
+    </div>
+
+    <div class="card">
+      <span class="kind">归约 · 3 版</span>
+      <h3>归一化 / 归约</h3>
+      <p><strong>主线</strong>：块内树形归约 + warp 内 shuffle 归约，一趟扫完 + 一次写回（fusion）。</p>
+      <p><strong>覆盖</strong>：Softmax（两次归约）、LayerNorm（两次归约 + centering）、RMSNorm（一次归约）</p>
+      <a class="more" href="normalization.html">详读原理与区别 →</a>
+    </div>
+
+    <div class="card">
+      <span class="kind">注意力 · 4 版</span>
+      <h3>FlashAttention</h3>
+      <p><strong>主线</strong>：分块 + Online Softmax，让中间 S 矩阵永不落地 HBM；再逐步 FA2 化（warp-per-row → Tensor Core）。</p>
+      <p><strong>覆盖</strong>：v1 online softmax → v2 causal → v3 warp-per-row → v4 fp16 mma</p>
+      <a class="more" href="flashattention.html">详读原理与区别 →</a>
+    </div>
+
+    <div class="card">
+      <span class="kind">封装 · 1 模块</span>
+      <h3>PyTorch 封装</h3>
+      <p><strong>主线</strong>：把三类手写 kernel 统一封成一个 <code>ai_infra_ops</code> 模块，接进 Python。</p>
+      <p><strong>覆盖</strong>：torch::Tensor 包装层 + PyBind11 绑定 + 数据校验 + 编译期模板派发</p>
+      <a class="more" href="torch_ext.html">详读封装要点 →</a>
+    </div>
+
+  </div>
+
+  <h2>三类算子的共同地基</h2>
+  <p>虽然表面各异，三类算子反复用到同一批 CUDA 基本功，读任意一类前先看懂这几件：</p>
+  <table>
+    <tr><th>概念</th><th>一句话</th><th>三类里的现身</th></tr>
+    <tr>
+      <td><strong>Shared Memory 分块</strong></td>
+      <td>把全局内存里会重复读的数据先搬进片上 SRAM 复用，换取更少的 HBM 访问。</td>
+      <td>GEMM 的 As/Bs tile；FA 的 Ktile/Vtile；Norm 的 s[BLOCK]</td>
+    </tr>
+    <tr>
+      <td><strong>Coalesced（合并访存）</strong></td>
+      <td>同一 warp 的 32 个线程在相邻地址读写，合并成一次 128B 事务。</td>
+      <td>GEMM 搬 tile 的 <code>tid, tid+256…</code> 接力；FA/Norm 搬行数据</td>
+    </tr>
+    <tr>
+      <td><strong>Bank Conflict</strong></td>
+      <td>shared memory 按 32 路 bank 组织，步长为 32 倍数的列访问会全撞同一 bank。</td>
+      <td>GEMM v1 的列优先反例；FA v3 的 <code>Ktile[Bc][D+1]</code> padding</td>
+    </tr>
+    <tr>
+      <td><strong>Warp 内归约</strong></td>
+      <td><code>__shfl_down_sync</code> 在寄存器间搬数，避免 <code>__syncthreads</code> 开销。</td>
+      <td>Softmax/LayerNorm/RMSNorm 的 32→1 归约；FA 的 max/sum</td>
+    </tr>
+    <tr>
+      <td><strong>Occupancy 与延迟隐藏</strong></td>
+      <td>SM 上并发 warp 越多，越能用计算掩盖内存延迟。</td>
+      <td>FA v3 的核心教训：occupancy 2%→79% 比一切计算优化都重要</td>
+    </tr>
+  </table>
+
+  <div class="footer">
+    <span>cuda-kernels · Ai-infra 练习仓库</span>
+    <span><a href="https://github.com/Eran-ovo/Ai-infra">GitHub ↗</a></span>
+  </div>
+
+</div>
+</body>
+</html>

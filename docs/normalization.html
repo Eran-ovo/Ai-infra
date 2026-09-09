@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>归一化 / 归约：Softmax · LayerNorm · RMSNorm | cuda-kernels</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <span class="brand">cuda-kernels 文档</span>
+  <nav>
+    <a href="index.html">总览</a>
+    <a href="gemm.html">GEMM</a>
+    <a href="normalization.html" class="active">归约 / 归一化</a>
+    <a href="flashattention.html">FlashAttention</a>
+    <a href="torch_ext.html">PyTorch 封装</a>
+  </nav>
+</header>
+
+<div class="wrap">
+
+  <div class="hero">
+    <h1>归一化 / 归约类：Softmax · LayerNorm · RMSNorm</h1>
+    <p class="sub">三个算子的共同骨架：一行一个 block，块内树形归约求统计量，最终一次写回。区别只在"归约几次、要不要减均值"。</p>
+  </div>
+
+  <h2>一、它们为什么是一类：同一个"行归约"骨架</h2>
+  <p>Softmax、LayerNorm、RMSNorm 都有一个共同特征：<strong>对矩阵的每一行做一个统计量（max / 和 / 平方和），再用这个统计量归一化该行</strong>。
+  问题本质是 <strong>row-wise reduction</strong>——把长度 N 的一行数据"压成一个标量"。这决定了它们的 CUDA 实现共享同一套模板：</p>
+  <ol>
+    <li><strong>一行一个 block</strong>（<code>grid = B</code>，<code>block = 256</code> 线程），线程只在自己的行里工作，block 之间零通信。</li>
+    <li><strong>线程粗化（grid-stride）</strong>：每线程先串行扫 N/BLOCK 个元素（如 <code>idx = tid; idx &lt; N; idx += BLOCK</code>），得到线程私有局部量。</li>
+    <li><strong>块内树形归约</strong>：256 → 128 → 64 → 32，每层用 <code>__syncthreads</code> 保证可见，落后线程负责累加。</li>
+    <li><strong>warp 内 shuffle 归约</strong>：32 → 1 不用共享内存，用 <code>__shfl_down_sync</code> 在寄存器间传递，省掉最贵的 sync。</li>
+    <li><strong>广播统计量 + 一次写回</strong>：所有线程拿到同一行标量，各自归一化自己的元素。</li>
+  </ol>
+
+  <div class="flow">
+    <span class="node">全局行数据</span><span class="arrow">→</span>
+    <span class="node">线程私有局部量</span><span class="arrow">→</span>
+    <span class="node">共享树形归约 (256→32)</span><span class="arrow">→</span>
+    <span class="node">warp shuffle (32→1)</span><span class="arrow">→</span>
+    <span class="node">广播 + 归一化写回</span>
+  </div>
+
+  <h2>二、归约的两种手段（骨架核心）</h2>
+  <h3>块内树形归约（256 → 32）</h3>
+  <pre>for (int s = BLOCK/2; s >= 32; s >>= 1) {
+    if (tid < s) sdata[tid] += sdata[tid + s];
+    __syncthreads();
+}</pre>
+  <p>每轮参与线程减半：第 1 轮 128 个线程把 <code>sdata[i+128]</code> 累加到 <code>sdata[i]</code>，第 2 轮 64 个……直到只剩 32 个有效值（一个 warp 的量）。每轮之间必须 <code>__syncthreads</code>，否则可能读到还没写好的中间值。</p>
+
+  <h3>warp 内 shuffle 归约（32 → 1）</h3>
+  <pre>for (int s = 16; s > 0; s >>= 1)
+    val += __shfl_down_sync(0xffffffff, val, s);</pre>
+  <p>降到 32 之后，剩下的线程恰好在一个 warp 内。warp 是 SIMD 一起执行的，<code>__shfl_down_sync</code> 直接从"比我低 s 位的 lane"那把值读进寄存器——<strong>不需要中间写共享内存，也不需要 <code>__syncthreads</code></strong>。这就是"树形归约做到 32 为止，最后一步换 shuffle"的全部理由。</p>
+  <div class="note"><b>一个易错点</b>：shuffle 的步长从 16 开始（不是 32）。因为 32 已是 warp 宽度，<code>shfl_down(32)</code> 会越界返回自身，导致值被翻倍。</div>
+
+  <h2>三、逐算子原理与区别</h2>
+
+  <div class="op">
+    <div class="op-head">
+      <span class="op-title">Softmax</span>
+      <span class="op-file">kernels/softmax_v1.cu</span>
+      <span class="op-perf">0.031 ms · maxErr 1.7e-08</span>
+    </div>
+    <div class="formula">softmax(x)_i = exp(x_i - max) / Σ_j exp(x_j - max)</div>
+    <p><strong>为什么减 max</strong>：直接算 <code>exp(x_i)</code> 会在 x_i 稍大时上溢（exp(90) 已超 fp32 范围）。减掉行最大值后指数 ≤ 0，值域稳定在 (0,1]，这是数值安全版的标准写法学。</p>
+    <p><strong>为什么是两次归约</strong>：softmax 需要两个统计量——先扫一遍求 <code>max</code>（第一次归约），再扫一遍求 <code>Σ exp(x-max)</code>（第二次归约），最后第三次写回归一化值。两次归约之间有<strong>数据依赖</strong>（求和需要先知道 max），所以是串行的两轮。</p>
+    <p><strong>特点</strong>：纯逐元素，不引入额外可学习参数。fused 到单个 kernel，中间结果（exp 值）不再写回全局内存。</p>
+  </div>
+
+  <div class="op">
+    <div class="op-head">
+      <span class="op-title">LayerNorm</span>
+      <span class="op-file">kernels/layernorm_v1.cu</span>
+      <span class="op-perf">0.030 ms · maxErr 4.5e-06</span>
+    </div>
+    <div class="formula">y = (x - mean) · rsqrt(var + eps),   mean = Σx/N,  var = Σ(x-mean)²/N</div>
+    <p><strong>为什么也是两次归约</strong>：第一次归约求 <code>Σx</code> 得 mean；第二次归约求 <code>Σ(x-mean)²</code> 得 var。后者依赖前者（方差要用均值），所以同样是串行两轮。</p>
+    <p><strong>关键实现巧思</strong>：求方差那轮循环里，先把差值 <code>d = x - mean</code> 顺便<strong>暂存</strong>到输出数组 <code>ry[idx] = d</code>，最后一轮拿到 <code>inv = rsqrt(var+eps)</code> 后直接 <code>ry[idx] *= inv</code>——<strong>省掉一次全局显存读</strong>（不用再读一遍 x）。</p>
+    <p><strong>与 softmax 的区别</strong>：都有两次依赖归约，但 softmax 归约的是 max 与 sum-of-exp，layernorm 归约的是 sum 与 sum-of-sq；layernorm 引入了"暂存差值"以减少写回。</p>
+  </div>
+
+  <div class="op v-highlight">
+    <div class="op-head">
+      <span class="op-title">RMSNorm（LLaMA/Qwen 标配）</span>
+      <span class="op-file">kernels/rmsnorm_v1.cu</span>
+      <span class="op-perf">0.031 ms · maxErr 1.7e-06</span>
+    </div>
+    <div class="formula">y = x · rsqrt(mean(x²) + eps) · g,   mean(x²) = Σx²/N</div>
+    <p><strong>与 LayerNorm 的本质区别：去掉 centering（减均值）</strong>。公式里没有 <code>x - mean</code>，只剩"除以 RMS（均方根）"。</p>
+    <p><strong>为什么更快（面试考点）</strong>：</p>
+    <ul>
+      <li><strong>一次归约 vs 两次串行归约</strong>：只需 <code>Σx²</code> 一个统计量，没有 mean 的依赖链，天然少一整轮归约 + sync；</li>
+      <li><strong>不用暂存 x-mean</strong>：省一次全局显存读写（对 LayerNorm，减 mean 那个中间量要么重读要么暂存）。</li>
+    </ul>
+    <p><strong>为什么引入 g（gamma）</strong>：可学习缩放参数。LLM 里大模型（LLaMA、Qwen、Mistral）发现去掉 centering 只保留缩放几乎不损精度、还更快，于是 RMSNorm 成为大模型标配。g 推理时也要乘。</p>
+    <p><strong>代码形态</strong>：与 layernorm 几乎同构，就是把"两轮归约"删成"一轮"（<code>sum_sq = Σ rx²</code> → 一次树形 + warp 归约 → <code>inv = rsqrtf(s[0]/N + eps)</code> → 写回 <code>x · inv · g</code>）。</p>
+  </div>
+
+  <h2>四、三者区别总览</h2>
+  <table>
+    <tr><th>算子</th><th>统计量</th><th>归约次数</th><th>是否减均值</th><th>可学习参数</th></tr>
+    <tr><td>Softmax</td><td>row max、Σexp(x-max)</td><td class="num">2</td><td>减 max（数值稳定，非 centering）</td><td>无</td></tr>
+    <tr><td>LayerNorm</td><td>mean、var</td><td class="num">2</td><td>是</td><td>（本实现无 affine，工程常用 β/γ）</td></tr>
+    <tr><td>RMSNorm</td><td>mean(x²)</td><td class="num">1</td><td>否</td><td>g (gamma)</td></tr>
+  </table>
+
+  <div class="tip"><b>为什么 fused 是最大卖点</b>：PyTorch 原生把 RMSNorm 拆成 pow→mean→rsqrt→mul 多个 kernel，中间结果反复写回显存；fused 一次加载、一次写回，3-5x 提速。这正是"手写算子 vs 库算子"在 <em>memory-bound</em> 问题上最典型的获胜场景（对比 GEMM 的 compute-bound，手写反而难赢）。</div>
+
+  <div class="note"><b>一句话区别</b>：Softmax 是"概率归一化"（两次归约：max + sum-of-exp），LayerNorm 是"减均值除标准差"（两次归约：mean + var），RMSNorm 是"只除 RMS 不减均值"（一次归约）——归约次数从 2 降到 1，是 RMSNorm 比 LayerNorm 快的根本原因。</div>
+
+  <div class="footer">
+    <span>cuda-kernels · 归约/归一化类</span>
+    <span><a href="gemm.html">← GEMM</a> · <a href="index.html">返回总览</a> · <a href="flashattention.html">下一类：FlashAttention →</a></span>
+  </div>
+
+</div>
+</body>
+</html>

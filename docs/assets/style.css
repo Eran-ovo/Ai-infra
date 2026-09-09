@@ -1,0 +1,169 @@
+/* =========================================================================
+   cuda-kernels 算子文档共享样式
+   所有分类页 index/gemm/normalization/flashattention 共用这一份 CSS。
+   新增分类页时：<head> 里 <link rel="stylesheet" href="assets/style.css">
+   ========================================================================= */
+
+:root {
+  --bg: #0f1216;
+  --bg-soft: #161a21;
+  --card: #1a1f29;
+  --card-2: #202734;
+  --border: #2b3342;
+  --text: #e6e9ef;
+  --text-dim: #9aa4b2;
+  --accent: #4f9cf9;
+  --accent-2: #34d399;
+  --accent-3: #f59e0b;
+  --warn: #ef4444;
+  --code-bg: #0b0e13;
+  --code-text: #d6dee9;
+  --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+          "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  line-height: 1.7;
+  font-size: 15px;
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* ---- 顶部导航 ---- */
+.topbar {
+  position: sticky; top: 0; z-index: 10;
+  background: rgba(15, 18, 22, 0.92);
+  backdrop-filter: blur(6px);
+  border-bottom: 1px solid var(--border);
+  padding: 10px 28px;
+  display: flex; align-items: center; gap: 22px;
+}
+.topbar .brand { font-weight: 700; font-size: 16px; color: var(--text); }
+.topbar nav { display: flex; gap: 4px; flex-wrap: wrap; }
+.topbar nav a {
+  color: var(--text-dim);
+  padding: 4px 12px; border-radius: 6px; font-size: 13.5px;
+}
+.topbar nav a:hover { color: var(--text); background: var(--card-2); text-decoration: none; }
+.topbar nav a.active { color: #0b0e13; background: var(--accent); font-weight: 600; }
+
+/* ---- 主体布局 ---- */
+.wrap { max-width: 1060px; margin: 0 auto; padding: 36px 28px 80px; }
+
+.hero { margin-bottom: 10px; }
+.hero h1 { font-size: 30px; margin: 0 0 6px; letter-spacing: -0.5px; }
+.hero .sub { color: var(--text-dim); font-size: 15px; margin: 0; }
+
+h2 {
+  font-size: 22px; margin: 48px 0 14px;
+  padding-bottom: 8px; border-bottom: 1px solid var(--border);
+}
+h2 .tag { font-size: 13px; color: var(--accent); font-weight: 500; margin-left: 10px; }
+h3 { font-size: 17px; margin: 30px 0 10px; color: #fff; }
+h4 { font-size: 15px; margin: 20px 0 8px; color: var(--accent); }
+
+p { margin: 10px 0; color: #c6cdd8; }
+strong { color: #fff; }
+em { color: var(--accent-2); font-style: normal; }
+
+/* ---- 卡片 ---- */
+.grid { display: grid; gap: 18px; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); }
+.card {
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 12px; padding: 20px 22px;
+  transition: border-color .15s, transform .15s;
+}
+.card:hover { border-color: var(--accent); transform: translateY(-2px); }
+.card h3 { margin: 0 0 8px; font-size: 17px; }
+.card .kind { font-size: 12px; color: var(--accent-2); text-transform: uppercase; letter-spacing: .04em; font-weight: 600; }
+.card p { margin: 6px 0; font-size: 13.5px; color: var(--text-dim); }
+.card .more { display: inline-block; margin-top: 8px; font-size: 13.5px; font-weight: 600; }
+
+/* ---- 算子版本卡片 ---- */
+.op {
+  background: var(--card-2); border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 10px; padding: 18px 22px; margin: 16px 0;
+}
+.op.v-highlight { border-left-color: var(--accent-3); }
+.op .op-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 6px; }
+.op .op-title { font-size: 16px; font-weight: 700; color: #fff; }
+.op .op-file { font-family: var(--mono); font-size: 12px; color: var(--text-dim); }
+.op .op-perf { font-family: var(--mono); font-size: 12.5px; color: var(--accent-2); margin-left: auto; }
+.op ul { margin: 8px 0 0; padding-left: 20px; }
+.op li { margin: 4px 0; color: #c6cdd8; }
+
+/* ---- 调用链 / 数据流 ---- */
+.flow {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
+  font-family: var(--mono); font-size: 13px;
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 10px; padding: 14px 16px; margin: 14px 0;
+}
+.flow .node { background: var(--card-2); border: 1px solid var(--border); border-radius: 6px; padding: 3px 10px; color: #fff; }
+.flow .arrow { color: var(--accent); }
+
+/* ---- 公式块 ---- */
+.formula {
+  font-family: var(--mono); font-size: 14.5px;
+  background: var(--code-bg); border: 1px solid var(--border);
+  border-radius: 8px; padding: 14px 18px; margin: 14px 0;
+  color: #f0f4fa; overflow-x: auto; white-space: pre;
+}
+
+/* ---- 代码块 ---- */
+pre {
+  background: var(--code-bg); border: 1px solid var(--border);
+  border-radius: 8px; padding: 16px 18px; overflow-x: auto;
+  font-family: var(--mono); font-size: 13px; line-height: 1.55;
+  color: var(--code-text);
+}
+code {
+  font-family: var(--mono);
+  background: var(--card-2); padding: 1px 6px; border-radius: 4px; font-size: 13px;
+}
+pre code { background: none; padding: 0; }
+
+/* ---- 表格 ---- */
+table { width: 100%; border-collapse: collapse; margin: 16px 0; font-size: 13.5px; }
+th, td { border: 1px solid var(--border); padding: 9px 12px; text-align: left; vertical-align: top; }
+th { background: var(--card-2); color: #fff; font-weight: 600; white-space: nowrap; }
+tr:nth-child(even) td { background: rgba(255,255,255,0.015); }
+td.num { font-family: var(--mono); white-space: nowrap; }
+td.good { color: var(--accent-2); }
+td.bad { color: var(--warn); }
+
+/* ---- 关键点提示框 ---- */
+.tip {
+  border-left: 3px solid var(--accent-3);
+  background: rgba(245, 158, 11, 0.07);
+  border-radius: 8px; padding: 12px 16px; margin: 16px 0; font-size: 14px;
+}
+.tip b { color: var(--accent-3); }
+.note {
+  border-left: 3px solid var(--accent);
+  background: rgba(79, 156, 249, 0.07);
+  border-radius: 8px; padding: 12px 16px; margin: 16px 0; font-size: 14px;
+}
+.note b { color: var(--accent); }
+
+/* ---- 页脚 ---- */
+.footer {
+  margin-top: 60px; padding-top: 18px; border-top: 1px solid var(--border);
+  color: var(--text-dim); font-size: 13px;
+  display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px;
+}
+.footer a { color: var(--text-dim); }
+
+@media (max-width: 640px) {
+  .wrap { padding: 24px 16px 60px; }
+  .topbar { padding: 10px 16px; gap: 10px; }
+}

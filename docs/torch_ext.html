@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PyTorch 封装：手写算子工业级落地 | cuda-kernels</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <span class="brand">cuda-kernels 文档</span>
+  <nav>
+    <a href="index.html">总览</a>
+    <a href="gemm.html">GEMM</a>
+    <a href="normalization.html">归约 / 归一化</a>
+    <a href="flashattention.html">FlashAttention</a>
+    <a href="torch_ext.html" class="active">PyTorch 封装</a>
+  </nav>
+</header>
+
+<div class="wrap">
+
+  <div class="hero">
+    <h1>PyTorch 封装：把手写 kernel 变成 torch 算子</h1>
+    <p class="sub">把 kernels/ 下 5 个手写算子（GEMM / Softmax / LayerNorm / RMSNorm / FlashAttention）统一封装成一个 PyTorch Extension 模块 ai_infra_ops —— 工业界标准的 CUDA → PyTorch 落地流程。</p>
+  </div>
+
+  <h2>一、为什么需要这一层：kernel 只是"半成品"</h2>
+  <p><code>kernels/</code> 里的算子都是<strong>独立的 <code>main()</code></strong>：自己 malloc、自己喂数据、自己对拍。它们是学习/验证用的，<strong>无法被 Python 直接调用</strong>。
+  要让这些手写 kernel 真正可用（写进模型、接进训练/推理），必须把它们暴露成 <code>torch.xxx()</code> 形式的算子——这就是 <code>torch_ext/</code> 干的事。</p>
+  <div class="flow">
+    <span class="node">手写 CUDA kernel (.cu)</span><span class="arrow">→</span>
+    <span class="node">torch::Tensor 包装层（校验 + launch）</span><span class="arrow">→</span>
+    <span class="node">PyBind11 绑定（bindings.cpp）</span><span class="arrow">→</span>
+    <span class="node">setup.py 编成 .so</span><span class="arrow">→</span>
+    <span class="node">import ai_infra_ops</span>
+  </div>
+
+  <h2>二、目录结构与职责分工</h2>
+  <table>
+    <tr><th>文件</th><th>职责</th></tr>
+    <tr><td><code>setup.py</code></td><td><code>CUDAExtension</code> 单模块构建，指定 <code>extra_cuda_cflags=["-O3"]</code></td></tr>
+    <tr><td><code>csrc/ops.h</code></td><td>所有 forward 入口函数的声明，屏蔽 .cu/.cpp 间重复</td></tr>
+    <tr><td><code>csrc/bindings.cpp</code></td><td><code>PYBIND11_MODULE</code> 把 6 个 forward 暴露成 Python 函数</td></tr>
+    <tr><td><code>csrc/*_cuda.cu</code></td><td>每个算子 = 一个 CUDA kernel + 一个 torch::Tensor 包装函数</td></tr>
+    <tr><td><code>test_all.py</code></td><td>正确性对拍（vs torch 原生）+ 性能 benchmark（交错计时）</td></tr>
+  </table>
+
+  <h2>三、每个算子的三层结构（以 RMSNorm 为例）</h2>
+  <p>每个算子都是一模一样的三段：<strong>kernel 不变 + 加一层 Tensor 包装</strong>。kernel 主体直接照搬 <code>kernels/rmsnorm_v1.cu</code>，差异只在输入输出从裸指针换成 <code>torch::Tensor</code>。</p>
+
+  <h3>第 1 层：CUDA kernel（同源，几乎不改）</h3>
+  <pre>__global__ void rmsnorm_fused(const float* __restrict__ x,
+                              const float* __restrict__ g,
+                              float* __restrict__ y, int N, float eps) {
+    // ... 与 kernels/rmsnorm_v1.cu 完全一致的归约 + 归一化逻辑
+}</pre>
+
+  <h3>第 2 层：torch::Tensor 包装（数据校验 + 拉参 + launch）</h3>
+  <pre>torch::Tensor rmsnorm_forward(torch::Tensor x, torch::Tensor g, double eps) {
+    TORCH_CHECK(x.is_cuda() && g.is_cuda(),        "x/g must be CUDA tensors");
+    TORCH_CHECK(x.dtype() == torch::kFloat32,      "x must be float32");
+    TORCH_CHECK(x.is_contiguous() && g.is_contiguous(), "x/g must be contiguous");
+    TORCH_CHECK(x.dim() == 2,                      "x must be [B, N]");
+
+    auto y = torch::empty_like(x);
+    rmsnorm_fused&lt;&lt;&lt;B, BLOCK&gt;&gt;&gt;(x.data_ptr&lt;float&gt;(),
+                                    g.data_ptr&lt;float&gt;(),
+                                    y.data_ptr&lt;float&gt;(), N, (float)eps);
+    return y;
+}</pre>
+
+  <h3>第 3 层：PyBind11 绑定</h3>
+  <pre>PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("rmsnorm", &rmsnorm_forward, "RMSNorm forward (CUDA)");
+}</pre>
+
+  <h2>四、面试关键点（这层最常被问）</h2>
+  <div class="op">
+    <div class="op-head"><span class="op-title">1. TORCH_CHECK 防御性校验</span></div>
+    <ul>
+      <li>进入 kernel 前先校验 <code>device</code> / <code>dtype</code> / <code>contiguous</code> / 维度——kernel 本身不做任何检查，非法输入会直接越界或算错，必须在包装层挡掉。</li>
+      <li>这是「C++ 与 Python 的边界安全」：Python 侧拿到的任何 tensor 都可能来自任意设备/类型。</li>
+    </ul>
+  </div>
+
+  <div class="op">
+    <div class="op-head"><span class="op-title">2. contiguous 为什么必须检查</span></div>
+    <p>kernel 用 <code>x + row*N</code> 这种<strong>线性地址</strong>定位元素，前提是内存连续。非连续 tensor（如转置视图、切片）用同样的指针算术会读到错误位置。</p>
+    <pre>TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+// 或者工程上更友好：x = x.contiguous();  // 就地转成连续副本</pre>
+  </div>
+
+  <div class="op">
+    <div class="op-head"><span class="op-title">3. data_ptr&lt;T&gt;() 拿裸指针</span></div>
+    <p><code>x.data_ptr&lt;float&gt;()</code> 返回 tensor 底层内存的 <code>float*</code>，传给 kernel 当 <code>const float*</code> 用。包装层与 kernel 之间靠「指针 + 形状参数（M/N/K）」约定，这正是 CUDA C 拉内核的标准姿势。</p>
+  </div>
+
+  <div class="op">
+    <div class="op-head"><span class="op-title">4. 单一模块 vs 多 .so</span></div>
+    <p>一个 <code>ai_infra_ops</code> 模块暴露全部 6 个算子，而不是每个算子一个共享库。工业界（FlashAttention 官方 repo、DeepSpeed op）都这么做：</p>
+    <ul>
+      <li>一次 <code>import</code> 全部可用，编译一次而非 N 次；</li>
+      <li>共享符号与头文件，operator 间可互相复用代码。</li>
+    </ul>
+  </div>
+
+  <div class="op">
+    <div class="op-head"><span class="op-title">5. 运行时 bool → 编译期模板（FlashAttention 的 causal）</span></div>
+    <p>causal 是 Python 传进来的运行时 bool。若直接 <code>if (causal)</code> 放进 kernel 每轮循环判断，会浪费每轮一次分支。做法是在<strong>包装层</strong> if/else 派发到两个编译期实例：</p>
+    <pre>if (causal) flash_fwd&lt;true&gt;&lt;&lt;&lt;grid, Br&gt;&gt;&gt;(...);
+else        flash_fwd&lt;false&gt;&lt;&lt;&lt;grid, Br&gt;&gt;&gt;(...);</pre>
+    <p>kernel 内部 <code>template&lt;bool IS_CAUSAL&gt;</code> 把 mask 条件在编译期固化，运行时零分支开销。</p>
+  </div>
+
+  <div class="op">
+    <div class="op-head"><span class="op-title">6. ABI 一致 + 架构白名单</span></div>
+    <ul>
+      <li><strong>ABI</strong>：setup.py 编译时 torch 自动对齐 <code>_GLIBCXX_USE_CXX11_ABI</code>，保证 C++ 标准库与 PyTorch 一致，否则 link 时符号错乱。</li>
+      <li><strong>TORCH_CUDA_ARCH_LIST</strong>：<code>export TORCH_CUDA_ARCH_LIST="8.6"</code> 只对目标架构（sm_86）编译，避免对所有架构浪费时间。</li>
+    </ul>
+  </div>
+
+  <h2>五、实测结果（RTX 3060 Laptop，test_all.py 复现）</h2>
+  <table>
+    <tr><th>算子</th><th>手写 CUDA</th><th>PyTorch 原生</th><th>加速比</th><th>结论</th></tr>
+    <tr><td>RMSNorm (B=1024 N=1024)</td><td class="num">0.031 ms</td><td class="num">0.156 ms</td><td class="num good">4.97x</td><td>fused 少写回中间结果</td></tr>
+    <tr><td>Softmax (B=1024 N=1024)</td><td class="num">0.031 ms</td><td class="num">0.030 ms</td><td class="num">0.98x</td><td>torch 本身已融合，打平合理</td></tr>
+    <tr><td>LayerNorm (B=1024 N=1024)</td><td class="num">0.040 ms</td><td class="num">0.125 ms</td><td class="num good">3.11x</td><td>同上</td></tr>
+    <tr><td>GEMM (1024³)</td><td class="num">3.04 ms</td><td class="num">0.33 ms (cuBLAS)</td><td class="num bad">0.11x</td><td>手写 tiled vs cuBLAS 真实差距</td></tr>
+    <tr><td>GEMM mma fp16 (1024³)</td><td class="num">0.542 ms</td><td class="num">0.237 ms (cuBLAS fp16)</td><td class="num bad">0.44x</td><td>Tensor Core 后差距从 13x 缩到 2.3x</td></tr>
+    <tr><td>FlashAttention (N=8192 D=64)</td><td class="num">causal 9.95 ms</td><td class="num">—</td><td class="num good">causal 2.06x</td><td>GPU 结果整一会写回</td></tr>
+  </table>
+
+  <div class="note"><b>为什么归一化类能赢、GEMM 输得惨</b>：归一化（RMSNorm/LayerNorm）是 <em>memory-bound</em> 问题——手写 fused 一次加载一次写回，天然赢过 PyTorch 拆成 pow→mean→rsqrt→mul 的多次读写；而 GEMM 是 <em>compute-bound</em>，对手是 cuBLAS 的 Tensor Core + 深度流水线，手写 tiled 不换硬件必输。一胜一负，恰好印证「优化要先分清 bound 类型」。</div>
+
+  <h2>六、编译与使用</h2>
+  <pre>cd torch_ext
+export PATH=/usr/local/cuda/bin:$PATH
+export TORCH_CUDA_ARCH_LIST="8.6"
+~/venvs/torch/bin/python setup.py build_ext --inplace
+~/venvs/torch/bin/python test_all.py</pre>
+  <pre>import ai_infra_ops
+ai_infra_ops.rmsnorm(x, g, eps)          # x [B,N] fp32, g [N]
+ai_infra_ops.softmax(x)                  # x [B,N] fp32
+ai_infra_ops.layernorm(x, eps)           # x [B,N] fp32，无 affine
+ai_infra_ops.gemm(a, b)                  # a [M,K] b [K,N] fp32 -> fp32（tiled）
+ai_infra_ops.gemm_mma(a, b)              # a [M,K] b [K,N] fp16 -> fp32（手写 Tensor Core）
+ai_infra_ops.flashattention(q, k, v, causal)  # q/k/v [N,64] fp32</pre>
+
+  <div class="footer">
+    <span>cuda-kernels · PyTorch 封装节</span>
+    <span><a href="flashattention.html">← FlashAttention</a> · <a href="index.html">返回总览</a></span>
+  </div>
+
+</div>
+</body>
+</html>

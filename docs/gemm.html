@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GEMM：从朴素循环到手写 Tensor Core | cuda-kernels</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <span class="brand">cuda-kernels 文档</span>
+  <nav>
+    <a href="index.html">总览</a>
+    <a href="gemm.html" class="active">GEMM</a>
+    <a href="normalization.html">归约 / 归一化</a>
+    <a href="flashattention.html">FlashAttention</a>
+    <a href="torch_ext.html">PyTorch 封装</a>
+  </nav>
+</header>
+
+<div class="wrap">
+
+  <div class="hero">
+    <h1>GEMM：从朴素循环到手写 Tensor Core</h1>
+    <p class="sub">一类算子、五版迭代：v0 朴素 → v1 smem tiling → v2 ldg → v3 CUTLASS → v4 手写 mma.sync。目标 M=N=K=1024，RTX 3060 Laptop 实测。</p>
+  </div>
+
+  <h2>一、算的是什么：C = A × B</h2>
+  <p>矩阵乘 <code>C[M×N] = A[M×K] · B[K×N]</code>，其中每个元素 <code>C[i][j] = Σₖ A[i][k]·B[k][j]</code>。
+  这是所有深度学习的核心运算（全连接层、卷积的 im2col、attention 的 QKᵀ 和 PV 都是它），也是 GPU 优化的"主战场"：一个 GEMM 算得够不够快，几乎决定了模型跑得够不够快。</p>
+  <div class="formula">C[i][j] = Σ_{k=0}^{K-1} A[i][k] · B[k][j]
+工作量   = 2·M·N·K 次浮点运算（M·N 个元素 × K 次乘加 × 2）</div>
+
+  <h2>二、核心矛盾：算力富裕，带宽不足</h2>
+  <p>GEMM 是一个 <em>compute-bound</em> 问题——算术强度（每字节访存能换来的浮点运算）非常高。
+  朴素实现的真正瓶颈不是"算不过来"，而是<strong>数据喂不饱计算单元</strong>：每个 C 元素要读 2K 个数，K 越大，重复读 A、B 的次数越多，全局内存带宽成了天花板。</p>
+  <p>所以五个版本的优化主线是同一件事：<strong>把会被反复读的数据，搬到离计算单元更近、更快的地方</strong>。加载一次、复用多次。</p>
+  <div class="flow">
+    <span class="node">HBM (DRAM)</span><span class="arrow">→</span>
+    <span class="node">Shared Memory</span><span class="arrow">→</span>
+    <span class="node">寄存器</span><span class="arrow">→</span>
+    <span class="node">计算单元</span>
+  </div>
+
+  <h2>三、逐版原理</h2>
+
+  <div class="op">
+    <div class="op-head">
+      <span class="op-title">v0 · Naive（一线程一元素）</span>
+      <span class="op-file">kernels/gemm_v0.cu</span>
+      <span class="op-perf">3.53 ms · 607 GFLOPS</span>
+    </div>
+    <p><strong>做法</strong>：每个线程负责 C 的一个元素，<code>row</code>、<code>col</code> 由线程索引推出，内层循环串行累加 K 次乘积。</p>
+    <pre>for (int i = 0; i < K; ++i)
+    sum += A[row*K + i] * B[i*N + col];</pre>
+    <p><strong>瓶颈</strong>：每个线程读 K 次 A 和 K 次 B，这些读取大多来自全局内存，且同一行 A / 同一列 B 被不同线程<em>重复读</em>。全局内存往返次数 = 2·K 次/元素，带宽被完全打爆。v0 的唯一价值是正确性基线。</p>
+  </div>
+
+  <div class="op">
+    <div class="op-head">
+      <span class="op-title">v1 · Shared Memory Tiling（分块复用）</span>
+      <span class="op-file">kernels/gemm_v1.cu</span>
+      <span class="op-perf">2.77 ms · 779 GFLOPS（~1.3x）</span>
+    </div>
+    <p><strong>核心思想</strong>：把整个乘分成 TILE×TILE 的小块，每块的 A、B 子块先由 block 全体线程搬进 shared memory，然后 block 内所有线程从 smem 反复读。这样全局内存里每一块数据只被搬一次，剩下的复用全部走 smem。</p>
+    <pre>#define TILE 32
+__shared__ float As[TILE][TILE];
+__shared__ float Bs[TILE][TILE];
+for (int t = 0; t < K/TILE; ++t) {
+    As[ty][tx] = A[row*K + t*TILE+tx];   // 协作搬入
+    Bs[ty][tx] = B[(t*TILE+ty)*N + col];
+    __syncthreads();                      // 搬完才能算
+    for (int k = 0; k < TILE; ++k)
+        sum += As[ty][k] * Bs[k][tx];     // 从 smem 读，复用
+    __syncthreads();                      // 下一轮要覆盖，先等算完
+}</pre>
+    <p><strong>为什么无 bank conflict</strong>：</p>
+    <ul>
+      <li><code>As[ty][k]</code>：同一 warp 内 ty 相同、k 相同 → 32 线程读<strong>同一地址</strong> → 广播，无冲突；</li>
+      <li><code>Bs[k][tx]</code>：tx 0~31 连续 → 32 线程读 32 个<strong>连续</strong>地址 → 落在 32 个不同 bank，无冲突。</li>
+    </ul>
+    <p>注释里的反例（<code>Bs[tx][k]</code> 列优先访问）会造成 32 路冲突，修法是 <code>Bs[TILE][TILE+1]</code> pad 一列。</p>
+  </div>
+
+  <div class="op">
+    <div class="op-head">
+      <span class="op-title">v2 · Coalesced + __ldg 只读缓存</span>
+      <span class="op-file">kernels/gemm_v2.cu</span>
+      <span class="op-perf">2.72 ms · 789 GFLOPS（+1.3%）</span>
+    </div>
+    <p><strong>核心思想</strong>：v1 已经把搬运做成了合并访存（地址连续 4B 递增 = 1 个 128B 事务）。v2 在 v1 基础上把 A/B 的全局加载改成 <code>__ldg</code>，走<strong>只读数据缓存（read-only cache / texture pipeline）</strong>，并加上 <code>__restrict__</code> 承诺指针不别名，让编译器更敢优化。</p>
+    <pre>As[ty][tx] = __ldg(&A[row*K + t*TILE+tx]);   // 走只读缓存</pre>
+    <p><strong>收益与意义</strong>：只比 v1 快 1.3%——说明"合并访存"这一最大头成本 v1 已拿到，v2 只是在带宽尾数上再抠一点。它验证了一个判断：<strong>访存微调的空间已近天花板，要靠换算法（Tensor Core）才有量级飞跃</strong>，这正是 v4 的动机。</p>
+  </div>
+
+  <div class="op">
+    <div class="op-head">
+      <span class="op-title">v3 · CUTLASS（工业级实现）</span>
+      <span class="op-file">kernels/gemm_v3_cutlass.cu</span>
+      <span class="op-perf">0.408 ms · 5259 GFLOPS（~6.5x）</span>
+    </div>
+    <p><strong>核心思想</strong>：直接调 NVIDIA CUTLASS 的 <code>cutlass::gemm::device::Gemm</code>，把 tile/warp/流水线配置在<strong>编译期固化</strong>，几乎零运行时开销。</p>
+    <pre>using Gemm = cutlass::gemm::device::Gemm&lt;float, RowMajor, float, RowMajor, float, RowMajor&gt;;
+Gemm::Arguments args({M,N,K}, {dA,K}, {dB,K}, {dC,N}, {dC,N}, {alpha,beta});
+gemm_op(args);</pre>
+    <p><strong>意义</strong>：v3 不是"手写版"，而是<strong>性能天花板参照物</strong>——它告诉你在同一块 GPU 上，GEMM 能做到多快（5259 GFLOPS）。与手写 v1 的 6.5 倍差距，就是 CUTLASS 的 <em>Tensor Core + 软件流水线 + 深层次 warp 分块</em> 贡献的价值，也是 v4 要逼近的目标。</p>
+  </div>
+
+  <div class="op v-highlight">
+    <div class="op-head">
+      <span class="op-title">v4 · 手写 Tensor Core（fp16 mma.sync）</span>
+      <span class="op-file">kernels/gemm_v4_mma.cu</span>
+      <span class="op-perf">0.542 ms · 3963 GFLOPS（1024³ 单次）</span>
+    </div>
+    <p><strong>核心思想</strong>：绕开 wmma API 和 CUTLASS，直接内联 PTX 指令 <code>mma.sync.aligned.m16n8k16.row.col</code>。把 v2 的"每周期 32 个 lane 各做 1 次乘加"（FMA）换成"<strong>每条指令整个 warp 完成 16×8×16=2048 次乘加</strong>"。</p>
+    <div class="flow">
+      <span class="node">global fp16 A/B</span><span class="arrow">→</span>
+      <span class="node">smem tile</span><span class="arrow">→</span>
+      <span class="node">fragment(寄存器)</span><span class="arrow">→</span>
+      <span class="node">mma.sync</span><span class="arrow">→</span>
+      <span class="node">fp32 acc</span><span class="arrow">→</span>
+      <span class="node">global C</span>
+    </div>
+
+    <h3>为什么必须先过 smem</h3>
+    <p>mma 指令要求输入按 <strong>fragment 布局</strong> 存放——每个 lane 持有的不是连续内存，而是"乱序"的特定位置（如 <code>(g, 2·gid)</code>）。若直接从 global 按这个布局读，会打散合并访存（coalesced）。正确姿势是：先用全体线程按 <code>tid, tid+256, …</code> 连续顺序<strong>合并地</strong>搬进 smem，再从 smem 按 fragment 布局自由索引（smem 带宽高、代价小）。这就是"分块搬 + 按需取"两步走。</p>
+
+    <h3>fragment 布局（踩坑重灾区）</h3>
+    <p>设 <code>g = lane/4</code>（groupID，0~7）、<code>gid = lane%4</code>（组内 id，0~3）：</p>
+    <table>
+      <tr><th>矩阵</th><th>每 lane 持有</th><th>精确布局</th></tr>
+      <tr><td>A (16×16 row-major)</td><td>4×half2 a0..a3</td><td>a0=(g,2gid) a1=(g+8,2gid) a2=(g,2gid+8) a3=(g+8,2gid+8)</td></tr>
+      <tr><td>B (16×8 col-major)</td><td>2×half2 b0,b1</td><td>b0=(2gid,g)/(2gid+1,g) b1=(2gid+8,g)/(2gid+9,g)</td></tr>
+      <tr><td>C (16×8 fp32)</td><td>4×float c0..c3</td><td>c0=(g,2gid) c1=(g,2gid+1) c2=(g+8,2gid) c3=(g+8,2gid+1)</td></tr>
+    </table>
+    <div class="tip"><b>踩坑判据</b>：A fragment 的 a1/a2 行索引写反 → 输出"前 16 行对、后 48 行错"的<em>不均匀错位</em>（而非全错）。这类"一半对一半错"是 fragment 映射 bug 的标志。<strong>定位手法</strong>：单 block + A=单位阵 + B=行号的确定性用例，dump 一列即可看出哪半块错位。</div>
+
+    <h3>正确性对拍的两个坑</h3>
+    <ul>
+      <li><strong>CPU 必须吃同一份 fp16 量化后的输入</strong>：0.2、0.4 这类值 fp16 无法精确表示，若 CPU 参考用原始 float、GPU 用 fp16，两边基准不同会误报 FAIL。做法：先把输入转 fp16 再转回 float，CPU 用这份转回来的数据。</li>
+      <li><strong>阈值用相对误差</strong>：fp16 GEMM 的绝对误差随 K 线性增长（累加项越多误差越大），绝对阈值在大规模必然误判，要除以参考值幅度。</li>
+    </ul>
+
+    <h3>如何读性能数字（避免误判）</h3>
+    <ul>
+      <li>2048 比 1024 慢 8 倍是<strong>健康的线性扩展</strong>（工作量 2·M·N·K ∝ D³，边长翻倍→8 倍）。判断标准看 GFLOPS 是否<strong>持平</strong>：1024→2048→4096 = 2847→3620→4322 GFLOPS，持平即健康。</li>
+      <li>若超出 8 倍（GFLOPS 塌陷）→ 笔记本 GPU 撞 TDP/温度墙降频。判定铁证：同一进程里 cuBLAS 也按同比例变慢（cuBLAS 不受我们 kernel 影响）。</li>
+      <li><strong>测量口径</strong>：单次 0.754ms vs 20 次平均 0.448ms 差异大——首次启动有冷缓存/未达稳态频率的开销，两种口径都要记录，避免"到底多少 GFLOPS"的歧义。</li>
+    </ul>
+  </div>
+
+  <h2>四、五版区别总览</h2>
+  <table>
+    <tr><th>版本</th><th>关键动作</th><th>解决什么</th><th>GFLOPS</th><th>相对 v0</th></tr>
+    <tr><td>v0 naive</td><td>一线程一元素，全走全局内存</td><td>（基线）</td><td class="num">607</td><td class="num">1.0x</td></tr>
+    <tr><td>v1 tiling</td><td>smem 分块复用 + 无 bank conflict</td><td>全局内存重复读</td><td class="num">779</td><td class="num">1.3x</td></tr>
+    <tr><td>v2 ldg</td><td><code>__ldg</code> 只读缓存 + <code>__restrict__</code></td><td>合并访存后的尾数</td><td class="num">789</td><td class="num">1.3x</td></tr>
+    <tr><td>v3 CUTLASS</td><td>编译期固化 tile/warp/流水线</td><td>（工业级天花板）</td><td class="num good">5259</td><td class="num good">8.7x</td></tr>
+    <tr><td>v4 mma</td><td>手写 mma.sync.m16n8k16，fp16 输入 fp32 累加</td><td>换硬件：FMA → Tensor Core</td><td class="num good">3963（单次）</td><td class="num good">6.5x</td></tr>
+  </table>
+
+  <div class="note"><b>一句话主线</b>：v1 解决"数据复用在 smem"，v2 解决"搬运合并 + 只读缓存"，v3 立出工业天花板，v4 用 Tensor Core 从 789 GFLOPS 跳到 ~4000+ GFLOPS，与 cuBLAS（~10 TFLOPS）差距缩到 2-4 倍。剩余差距来自无 cp.async 双缓冲 / ldmatrix / 大 tile——是后续迭代点。</div>
+
+  <div class="footer">
+    <span>cuda-kernels · GEMM 类</span>
+    <span><a href="index.html">← 返回总览</a> · <a href="normalization.html">下一类：归约/归一化 →</a></span>
+  </div>
+
+</div>
+</body>
+</html>

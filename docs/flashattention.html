@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FlashAttention：分块 + Online Softmax | cuda-kernels</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <span class="brand">cuda-kernels 文档</span>
+  <nav>
+    <a href="index.html">总览</a>
+    <a href="gemm.html">GEMM</a>
+    <a href="normalization.html">归约 / 归一化</a>
+    <a href="flashattention.html" class="active">FlashAttention</a>
+    <a href="torch_ext.html">PyTorch 封装</a>
+  </nav>
+</header>
+
+<div class="wrap">
+
+  <div class="hero">
+    <h1>FlashAttention：分块 + Online Softmax</h1>
+    <p class="sub">四个版本复现 FA2：v1 分块 + online softmax → v2 causal → v3 warp-per-row → v4 fp16 Tensor Core。核心主张始终是「让 S 矩阵永不落地 HBM」。</p>
+  </div>
+
+  <h2>一、先看标准 attention 哪里"贵"</h2>
+  <p>给定 Q/K/V ∈ R<sup>N×D</sup>，单头标准 attention 是两步矩阵乘夹一个 softmax：</p>
+  <div class="formula">S  = Q · Kᵀ / √D        (N×N 的分数矩阵，O(N²D) 次运算，O(N²) 内存)
+P  = softmax(S)          (按行归一化)
+O  = P · V               (N×D 输出)</div>
+  <p><strong>朴素实现的瓶颈</strong>：S 矩阵大小是 N×N，对长序列（N=8192）是 8192²×4B ≈ 256MB。<strong>必须把 S 写回全局内存（HBM）再读回来</strong>做 softmax 和 ×V——这一写一读完全受 HBM 带宽限制，是 memory-bound 的灾难。</p>
+
+  <h2>二、核心思想：分块 + Online Softmax</h2>
+  <p>FlashAttention 的洞见有两点：</p>
+  <ol>
+    <li><strong>分块（tiling）</strong>：把 K/V 切成 Bc 行一块，每次只算 S 的一小条 <code>Br×Bc</code>，在片上算完 softmax 和 ≤×V 的贡献，<strong>S 块用后即弃</strong>——永远不落 HBM。</li>
+    <li><strong>Online Softmax</strong>：softmax 的 max 和 sum 可以"流式"维护，不用等所有分数算齐。每来一个新块，旧统计量用一个系数 <code>alpha</code> 修正即可。</li>
+  </ol>
+
+  <h3>Online Softmax 的数学（关键）</h3>
+  <p>对每一行，维护三个运行量：<code>m</code>（迄今最大分数）、<code>l</code>（Σexp(S-m)）、<code>acc</code>（Σexp(S-m)·V，未归一化分子）。每处理一个新块，新旧两块合并：</p>
+  <div class="formula">m_new = max(m_old, m_row)                // m_row 是本块最大分数
+alpha = exp(m_old - m_new)              // 旧最大变小 → 旧统计要按比例缩小
+l_new = alpha·l_old + Σ_c exp(S[c]-m_new)
+acc   = alpha·acc + Σ_c exp(S[c]-m_new)·V[c]</div>
+  <p>直觉：旧的最大值若被新块超过，旧块的 exp(S-m_old) 全部偏大，<strong>乘 alpha 统一缩回去</strong>，再叠上新块的贡献。最终 <code>O = acc / l</code>。这就是"不必回头、单遍扫过 KV"的全部依据。</p>
+
+  <div class="flow">
+    <span class="node">Q 行(驻寄存器)</span><span class="arrow">→</span>
+    <span class="node">逐块搬 K/V 进 smem</span><span class="arrow">→</span>
+    <span class="node">算 S 块 + online softmax</span><span class="arrow">→</span>
+    <span class="node">累加 O(=acc/l)</span><span class="arrow">→</span>
+    <span class="node">写回</span>
+  </div>
+
+  <h2>三、逐版原理</h2>
+
+  <div class="op">
+    <div class="op-head">
+      <span class="op-title">v1 · 分块 + Online Softmax</span>
+      <span class="op-file">kernels/flashattention_v1.cu</span>
+      <span class="op-perf">0.199 ms · N=512, D=64, Br/Bc=32</span>
+    </div>
+    <p><strong>线程映射</strong>：<em>一线程一行</em>。每 block 处理 Br=32 行 Q、block 内 32 线程各管一行，逐块搬 Bc=32 行 K/V 进 smem，内层循环扫完所有 KV 块。</p>
+    <p><strong>关键结构</strong>：Q 行全程驻在寄存器 <code>q_reg[D]</code>（外层循环复用，不回 HBM）；每轮把 <code>S[Bc]</code> 这一小条分数在寄存器里算完、做完 online softmax、累进 <code>acc[D]</code>——S 从不写回全局内存。</p>
+    <p><strong>这版的价值</strong>：验证了 online softmax 的<strong>数值正确性</strong>（maxErr 2.4e-07 与标准实现一致），并建立了分块骨架。问题也同时埋下：一线程一行导致每个 block 只有 1 个 warp，occupancy 极低（见 v3）。</p>
+  </div>
+
+  <div class="op">
+    <div class="op-head">
+      <span class="op-title">v2 · Causal Mask（模板双模式）</span>
+      <span class="op-file">kernels/flashattention_v2.cu</span>
+      <span class="op-perf">full 9.43 / causal 4.71 ms · N=8192 · causal 2.00x</span>
+    </div>
+    <p><strong>加了什么</strong>：GPT 自回归的 causal mask——第 q 行只能看到 j≤q 的 KV（下三角）。用 <code>template&lt;bool IS_CAUSAL&gt;</code> 做<strong>编译期双模式</strong>，运行时 bool 在包装层 if/else 派发，kernel 内无运行时分支。</p>
+    <pre>// 块级截断：整块跳过未来信息
+const int kv_end = IS_CAUSAL ? (q_row_max / Bc + 1) : num_kv_blks;
+for (int kv_blk = 0; kv_blk &lt; kv_end; ++kv_blk) {
+    ...
+    if (IS_CAUSAL && kv_col > q_row) { S[c] = -1e20f; continue; }  // 对角线块逐元素 mask</pre>
+    <p><strong>两层式因果</strong>：① 循环上界按 block 粒度截断（必须全 block 一致，否则 <code>__syncthreads</code> 被最慢线程拖着走，省不了块）；② 对角线块内再逐元素 mask。causal 理论上省一半计算（只算下三角），N=8192 时实测 2.00x ——<strong>恰好命中理论上限</strong>。</p>
+    <div class="tip"><b>踩坑</b>：初版在 N=512 时 causal 反而 0.84x（负优化）。ncu 定位：occupancy 仅 2.08%，每 block 只 1 个 warp，内存延迟完全无法隐藏，省下的计算被串行延迟淹没。<strong>教训：低 occupancy 下谈计算量优化是空中楼阁</strong>。</div>
+  </div>
+
+  <div class="op">
+    <div class="op-head">
+      <span class="op-title">v3 · Warp-per-row（FA2 的核心重划分）</span>
+      <span class="op-file">kernels/flashattention_v3.cu</span>
+      <span class="op-perf">full 17.7 / causal 8.8 ms · N=8192 · causal 2.01x</span>
+    </div>
+    <p><strong>解决什么</strong>：v2 一线程一行的架构，每线程要同时持有 <code>q_reg[64] + acc[64]</code>，寄存器爆炸 → 每 block 只能 1 warp → occupancy 2%。</p>
+    <p><strong>改法（对齐 FA2 思想）</strong>：<em>一 warp 一行</em>。block = 256 线程 = 8 warps，每 warp 独占一行 Q，warp 内 32 个 lane 分摊 D=64 维（每 lane 只存 <code>q_reg[2] + acc[2]</code>）。寄存器需求从 ~130 降到 ~40/线程，<strong>occupancy 2% → 79%</strong>。</p>
+    <pre>// 每个 lane 只负责 DQ=D/32=2 维
+__shared__ float Ktile[Bc][D+1];   // 【padding】行宽 65 与 32 互质
+__shared__ float Vtile[Bc][D+1];
+// 每 lane 独立算自己那行 K 的完整点积（Bc==WARP，c=lane 正好一个分数）</pre>
+    <p><strong>三个踩坑（教训）</strong>：</p>
+    <ul>
+      <li><strong>发散分支禁用跨 lane shuffle</strong>：初版在 causal 分支下用 <code>__shfl_xor</code> 归约 → 直接死锁。解法：每 lane 独立算完整点积，不再跨 lane 凑。</li>
+      <li><strong>不能 return 提前退出</strong>：<code>if(q_row&gt;=N) return</code> 会让部分 warp 退出、留下 <code>__syncthreads</code> 死等。改 valid 标记"陪跑"。</li>
+      <li><strong>列访问 bank conflict</strong>：K/V 按列访问时地址步长 = D。D=64 是 32 的倍数 → 全撞同一 bank（9.4 亿次冲突）。修法 <code>Ktile[Bc][D+1]</code>，步长 65 与 32 互质，冲突降 14x。</li>
+    </ul>
+    <p><strong>仍比 v2 慢 1.8x 的归因</strong>：K/V 随 block 数增多重复搬运 + Q 点积冗余。<strong>说明 occupancy 与算术强度是三角债，拉满一个可能拖累另一个</strong>。</p>
+  </div>
+
+  <div class="op v-highlight">
+    <div class="op-head">
+      <span class="op-title">v4 · fp16 + 手写 Tensor Core（复现 FA2 的关键一步）</span>
+      <span class="op-file">kernels/flashattention_v4.cu</span>
+      <span class="op-perf">N=4096 1.53 ms（full attention）</span>
+    </div>
+    <p><strong>解决什么</strong>：v3 是 fp32，QKᵀ 和 PV 两个矩阵乘仍是 FMA 逐点算。与 GEMM v4 同理——真正复现 FA2 性能要把这两个 GEMM 换成 Tensor Core。</p>
+    <p><strong>改法</strong>：Q/K/V 用 fp16，累加和 softmax 用 fp32。<code>S = Q@Kᵀ</code> 和 <code>O += P@V</code> 都用 <code>mma.sync.m16n8k16</code>。</p>
+    <ul>
+      <li><strong>warp 划分对齐 FA2</strong>：每 block 处理 Bq=64 行 Q，4 个 warp，每 warp 独占 16 行（正好一个 mma 的 M-tile）。</li>
+      <li><strong>行归约全在 warp 内</strong>：每 warp 扫全部 K/V 块，softmax 的 max/sum 归约不跨 warp 通信，直接继承 v3 的在线软 max。</li>
+      <li><strong>fragment 布局复用 gemm_v4 的已验证版</strong>：<code>load_A_verified</code> 直接搬 gemm_v4 的 A fragment 布局（a0~a3），踩过的坑不再重踩。</li>
+    </ul>
+    <p><strong>当前边界</strong>：Stage 1 只做 full attention（非 causal），Bq=Bc=D=64 固定，N 需被 64 整除——纯最小实现，先验证 mma 通路与布局正确，与 GEMM v4 定位一致。</p>
+  </div>
+
+  <h2>四、四版区别总览</h2>
+  <table>
+    <tr><th>版本</th><th>线程映射</th><th>精度</th><th>causal</th><th>核心增量</th></tr>
+    <tr><td>v1</td><td>一线程一行</td><td>fp32</td><td>否</td><td>分块 + online softmax（S 不落 HBM）</td></tr>
+    <tr><td>v2</td><td>一线程一行</td><td>fp32</td><td>✔ 模板双模式</td><td>causal 块级截断 + 逐元素 mask</td></tr>
+    <tr><td>v3</td><td>一 warp 一行</td><td>fp32</td><td>✔</td><td>warp-per-row 寄存器瘦身 + padding 消 bank conflict</td></tr>
+    <tr><td>v4</td><td>一 warp 16 行</td><td>fp16 / fp32 累加</td><td>否（Stage 1）</td><td>手写 mma.sync 做 QKᵀ 与 PV</td></tr>
+  </table>
+
+  <div class="note"><b>一句话主线</b>：v1 奠定"分块 + online softmax"的正确性骨架；v2 补 causal 并踩出 occupancy 的教训；v3 用 warp-per-row 把 occupancy 从 2% 拉回 79%；v4 最终把两个 GEMM 换成 Tensor Core——四步走完，手工实现正式向 FA2 对齐。</div>
+
+  <div class="footer">
+    <span>cuda-kernels · FlashAttention 类</span>
+    <span><a href="normalization.html">← 归约/归一化</a> · <a href="index.html">返回总览</a></span>
+  </div>
+
+</div>
+</body>
+</html>
