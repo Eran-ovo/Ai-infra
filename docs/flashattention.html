@@ -33,6 +33,34 @@ P  = softmax(S)          (按行归一化)
 O  = P · V               (N×D 输出)</div>
   <p><strong>朴素实现的瓶颈</strong>：S 矩阵大小是 N×N，对长序列（N=8192）是 8192²×4B ≈ 256MB。<strong>必须把 S 写回全局内存（HBM）再读回来</strong>做 softmax 和 ×V——这一写一读完全受 HBM 带宽限制，是 memory-bound 的灾难。</p>
 
+  <p><strong>数据怎么流动</strong>（下面这张 N×N 的 S 就是"元凶"）：</p>
+  <div class="move-row" style="gap:14px">
+    <table class="mx" style="grid-template-columns: repeat(3,34px);">
+      <tr><td class="mx-cell mx-c-a">Q</td><td class="mx-cell mx-c-a">·</td><td class="mx-cell mx-c-a">·</td></tr>
+      <tr><td class="mx-cell mx-c-a">·</td><td class="mx-cell mx-c-a">·</td><td class="mx-cell mx-c-a">·</td></tr>
+      <tr><td class="mx-cell mx-c-a">·</td><td class="mx-cell mx-c-a">·</td><td class="mx-cell mx-c-a">·</td></tr>
+    </table>
+    <span class="arrow-c">×</span>
+    <table class="mx" style="grid-template-columns: repeat(3,34px);">
+      <tr><td class="mx-cell mx-c-b">Kᵀ</td><td class="mx-cell mx-c-b">·</td><td class="mx-cell mx-c-b">·</td></tr>
+      <tr><td class="mx-cell mx-c-b">·</td><td class="mx-cell mx-c-b">·</td><td class="mx-cell mx-c-b">·</td></tr>
+      <tr><td class="mx-cell mx-c-b">·</td><td class="mx-cell mx-c-b">·</td><td class="mx-cell mx-c-b">·</td></tr>
+    </table>
+    <span class="arrow-c">=</span>
+    <table class="mx" style="grid-template-columns: repeat(3,34px);">
+      <tr><td class="mx-cell mx-c-hot">S̶</td><td class="mx-cell mx-c-hot">S̶</td><td class="mx-cell mx-c-hot">S̶</td></tr>
+      <tr><td class="mx-cell mx-c-hot">S̶</td><td class="mx-cell mx-c-hot">S̶</td><td class="mx-cell mx-c-hot">S̶</td></tr>
+      <tr><td class="mx-cell mx-c-hot">S̶</td><td class="mx-cell mx-c-hot">S̶</td><td class="mx-cell mx-c-hot">S̶</td></tr>
+    </table>
+    <span class="arrow-c">×V</span>
+    <table class="mx" style="grid-template-columns: repeat(3,34px);">
+      <tr><td class="mx-cell mx-c-c mut">O</td><td class="mx-cell mx-c-c">·</td><td class="mx-cell mx-c-c">·</td></tr>
+      <tr><td class="mx-cell mx-c-c">·</td><td class="mx-cell mx-c-c">·</td><td class="mx-cell mx-c-c">·</td></tr>
+      <tr><td class="mx-cell mx-c-c">·</td><td class="mx-cell mx-c-c">·</td><td class="mx-cell mx-c-c">·</td></tr>
+    </table>
+  </div>
+  <p class="mx-cap">中间那个 <span style="color:#ff6b6b">S</span>（划掉 = 不应该存在！）在朴素实现里要先写进 HBM 再读回来——FA 的整个设计就是<strong>让它根本不落地</strong>。</p>
+
   <h2>二、核心思想：分块 + Online Softmax</h2>
   <p>FlashAttention 的洞见有两点：</p>
   <ol>
@@ -55,6 +83,36 @@ acc   = alpha·acc + Σ_c exp(S[c]-m_new)·V[c]</div>
     <span class="node">累加 O(=acc/l)</span><span class="arrow">→</span>
     <span class="node">写回</span>
   </div>
+
+  <p><strong>分块扫描长什么样</strong>——下面这个 seeker 就是逐块搬进来的 K/V 块，它从左往右扫过一整行 Q；每扫一块，就更新一次 O（那个小方块）：</p>
+  <div class="slide">
+    <div class="seeker" style="--c:var(--accent-2)"></div>
+    <table class="mx" style="grid-template-columns: repeat(6,34px);">
+      <tr>
+        <td class="mx-cell mx-c-a mut">Q行</td>
+        <td class="mx-cell mx-c-a mut">K₀</td><td class="mx-cell mx-c-a">K₁</td><td class="mx-cell mx-c-a">K₂</td><td class="mx-cell mx-c-a">K₃</td><td class="mx-cell mx-c-a">K₄</td>
+      </tr>
+      <tr>
+        <td class="mx-cell mx-c-hot mut">S条</td><td class="mx-cell mx-c-hot mut">s₀</td><td class="mx-cell mx-c-hot">s₁</td><td class="mx-cell mx-c-hot">s₂</td><td class="mx-cell mx-c-hot">s₃</td><td class="mx-cell mx-c-hot">s₄</td>
+      </tr>
+      <tr>
+        <td class="mx-cell mx-c-c mut">O</td>
+        <td class="mx-cell mx-c-c mut">+</td><td class="mx-cell mx-c-c">+</td><td class="mx-cell mx-c-c">+</td><td class="mx-cell mx-c-c">+</td><td class="mx-cell mx-c-c">+</td>
+      </tr>
+    </table>
+  </div>
+  <p class="mx-cap">绿框每扫一格：算这条 S 的分数 → 在线 softmax → 累进 O。全程 S 只是一条短向量，从不出片上。</p>
+
+  <h4>Online Softmax 的状态怎么"边扫边改"</h4>
+  <p>盯住"迄今最大分数 m"和"累积和 l"这两个数，扫到第 2 块时若发现新块有更大的分数，旧统计就要打个折（<span class="alpha" style="color:var(--accent-2)">alpha</span>）再叠新的：</p>
+  <div class="oshare">
+    <div class="chip"><b>扫到块 0</b><span>m = 3</span></div>
+    <div class="chip"><b>扫到块 1</b><span>m = <span class="new">5</span> ← 更大</span></div>
+    <div class="chip"><b>alpha = exp(3−5)</b><span class="alpha">e⁻² ≈ 0.135</span></div>
+    <div class="chip"><b>l 修正</b><span>l = <span class="alpha">0.135·l_old</span> + Σexp(s−5)</span></div>
+    <div class="chip"><b>最终</b><span>O = acc / l</span></div>
+  </div>
+  <p class="mx-cap">max 被顶高时，之前所有 exp 都要乘 e^(m_old−m_new) 缩回去——这就是 <code>alpha</code> 的作用，让统计量"永远跟得上最新的 max"。</p>
 
   <h2>三、逐版原理</h2>
 
@@ -83,6 +141,15 @@ for (int kv_blk = 0; kv_blk &lt; kv_end; ++kv_blk) {
     if (IS_CAUSAL && kv_col > q_row) { S[c] = -1e20f; continue; }  // 对角线块逐元素 mask</pre>
     <p><strong>两层式因果</strong>：① 循环上界按 block 粒度截断（必须全 block 一致，否则 <code>__syncthreads</code> 被最慢线程拖着走，省不了块）；② 对角线块内再逐元素 mask。causal 理论上省一半计算（只算下三角），N=8192 时实测 2.00x ——<strong>恰好命中理论上限</strong>。</p>
     <div class="tip"><b>踩坑</b>：初版在 N=512 时 causal 反而 0.84x（负优化）。ncu 定位：occupancy 仅 2.08%，每 block 只 1 个 warp，内存延迟完全无法隐藏，省下的计算被串行延迟淹没。<strong>教训：低 occupancy 下谈计算量优化是空中楼阁</strong>。</div>
+    <p><strong>causal mask 就是只留左下三角</strong>——右上角全是不该看的"未来"，直接跳过：</p>
+    <table class="mx" style="grid-template-columns: repeat(5,34px);">
+      <tr><td class="mx-cell mx-c-b mut">✓</td><td class="mx-cell mx-c-dim">✗</td><td class="mx-cell mx-c-dim">✗</td><td class="mx-cell mx-c-dim">✗</td><td class="mx-cell mx-c-dim">✗</td></tr>
+      <tr><td class="mx-cell mx-c-b mut">✓</td><td class="mx-cell mx-c-b mut">✓</td><td class="mx-cell mx-c-dim">✗</td><td class="mx-cell mx-c-dim">✗</td><td class="mx-cell mx-c-dim">✗</td></tr>
+      <tr><td class="mx-cell mx-c-b mut">✓</td><td class="mx-cell mx-c-b mut">✓</td><td class="mx-cell mx-c-b mut">✓</td><td class="mx-cell mx-c-dim">✗</td><td class="mx-cell mx-c-dim">✗</td></tr>
+      <tr><td class="mx-cell mx-c-b mut">✓</td><td class="mx-cell mx-c-b mut">✓</td><td class="mx-cell mx-c-b mut">✓</td><td class="mx-cell mx-c-b mut">✓</td><td class="mx-cell mx-c-dim">✗</td></tr>
+      <tr><td class="mx-cell mx-c-b mut">✓</td><td class="mx-cell mx-c-b mut">✓</td><td class="mx-cell mx-c-b mut">✓</td><td class="mx-cell mx-c-b mut">✓</td><td class="mx-cell mx-c-b mut">✓</td></tr>
+    </table>
+    <p class="mx-cap"><span style="color:var(--accent-2)">✓</span> = 算（下三角），<span class="mx-c-dim">✗</span> = 跳过（上三角）。正好省一半 → 实测 causal 2.00x 就是命中这个理论值。</p>
   </div>
 
   <div class="op">

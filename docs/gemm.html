@@ -32,6 +32,16 @@
   <div class="formula">C[i][j] = Σ_{k=0}^{K-1} A[i][k] · B[k][j]
 工作量   = 2·M·N·K 次浮点运算（M·N 个元素 × K 次乘加 × 2）</div>
 
+  <div class="slide">
+    <div class="seeker" style="--c:#ff6b6b"></div>
+    <table class="mx" style="grid-template-columns: repeat(4, 34px);">
+      <tr><td class="mx-cell mx-c-c mut sub">c₀₀</td><td class="mx-cell mx-c-c sub">c₀₁</td><td class="mx-cell mx-c-c sub">c₀₂</td><td class="mx-cell mx-c-c sub">…</td></tr>
+      <tr><td class="mx-cell mx-c-c sub">c₁₀</td><td class="mx-cell mx-c-c mut sub">c₁₁</td><td class="mx-cell mx-c-c sub">c₁₂</td><td class="mx-cell mx-c-c sub">…</td></tr>
+      <tr><td class="mx-cell mx-c-c sub">…</td><td class="mx-cell mx-c-c sub">…</td><td class="mx-cell mx-c-c sub">…</td><td class="mx-cell mx-c-c sub">…</td></tr>
+    </table>
+  </div>
+  <p class="mx-cap">C 的每个格子 c[i][j] 都要"读一整行 A、读一整列 B"来累加。</p>
+
   <h2>二、核心矛盾：算力富裕，带宽不足</h2>
   <p>GEMM 是一个 <em>compute-bound</em> 问题——算术强度（每字节访存能换来的浮点运算）非常高。
   朴素实现的真正瓶颈不是"算不过来"，而是<strong>数据喂不饱计算单元</strong>：每个 C 元素要读 2K 个数，K 越大，重复读 A、B 的次数越多，全局内存带宽成了天花板。</p>
@@ -75,6 +85,23 @@ for (int t = 0; t < K/TILE; ++t) {
         sum += As[ty][k] * Bs[k][tx];     // 从 smem 读，复用
     __syncthreads();                      // 下一轮要覆盖，先等算完
 }</pre>
+    <div class="move-row">
+      <span class="mv">global</span>
+      <span class="ghost ga"></span><span class="arrow-c">→</span>
+      <span class="ghost gb"></span>
+      <span class="mv">smem As/Bs</span>
+      <span class="arrow-c">→</span>
+      <span class="mv">32 线程从这重复读</span>
+    </div>
+    <p>下面这块 6×6 就是搬进 smem 的一个 tile：<strong>搬一次，块内 16×16 个线程反复读它算各自的 C</strong>——这是"加载一次、复用多次"的全部含义。</p>
+    <table class="mx" style="grid-template-columns: repeat(6, 34px);">
+      <tr><td class="mx-cell mx-c-a">a</td><td class="mx-cell mx-c-a">a</td><td class="mx-cell mx-c-a">a</td><td class="mx-cell mx-c-a">a</td><td class="mx-cell mx-c-a">a</td><td class="mx-cell mx-c-a">a</td></tr>
+      <tr><td class="mx-cell mx-c-a">a</td><td class="mx-cell mx-c-a">a</td><td class="mx-cell mx-c-a">a</td><td class="mx-cell mx-c-a">a</td><td class="mx-cell mx-c-a">a</td><td class="mx-cell mx-c-a">a</td></tr>
+      <tr><td class="mx-cell mx-c-a">a</td><td class="mx-cell mx-c-a">a</td><td class="mx-cell mx-c-a">a</td><td class="mx-cell mx-c-a">a</td><td class="mx-cell mx-c-a">a</td><td class="mx-cell mx-c-a">a</td></tr>
+      <tr><td class="mx-cell mx-c-a">a</td><td class="mx-cell mx-c-a">a</td><td class="mx-cell mx-c-a">a</td><td class="mx-cell mx-c-a">a</td><td class="mx-cell mx-c-a">a</td><td class="mx-cell mx-c-a">a</td></tr>
+      <tr><td class="mx-cell mx-c-b">b</td><td class="mx-cell mx-c-b">b</td><td class="mx-cell mx-c-b">b</td><td class="mx-cell mx-c-b">b</td><td class="mx-cell mx-c-b">b</td><td class="mx-cell mx-c-b">b</td></tr>
+      <tr><td class="mx-cell mx-c-b">b</td><td class="mx-cell mx-c-b">b</td><td class="mx-cell mx-c-b">b</td><td class="mx-cell mx-c-b">b</td><td class="mx-cell mx-c-b">b</td><td class="mx-cell mx-c-b">b</td></tr>
+    </table>
     <p><strong>为什么无 bank conflict</strong>：</p>
     <ul>
       <li><code>As[ty][k]</code>：同一 warp 内 ty 相同、k 相同 → 32 线程读<strong>同一地址</strong> → 广播，无冲突；</li>
@@ -122,6 +149,18 @@ gemm_op(args);</pre>
       <span class="node">fp32 acc</span><span class="arrow">→</span>
       <span class="node">global C</span>
     </div>
+
+    <p>下面这条 <strong>seeker 红框</strong>沿 K 维扫过：它就是 mma 每次"一口气吃掉 16 个 K 值、把 2048 次乘加攒进输出块"的动作。每个 c 格子在红框扫过的全程里持续累加。</p>
+    <div class="slide">
+      <div class="seeker" style="--c:#ff6b6b"></div>
+      <table class="mx" style="grid-template-columns: repeat(4, 34px);">
+        <tr><td class="mx-cell mx-c-a mut">A16×16</td><td class="mx-cell mx-c-a sub">k=0</td><td class="mx-cell mx-c-a sub">k=1</td><td class="mx-cell mx-c-a sub">k=2</td></tr>
+        <tr><td class="mx-cell mx-c-b sub">B16×8</td><td class="mx-cell mx-c-b mut">k=0</td><td class="mx-cell mx-c-b sub">k=1</td><td class="mx-cell mx-c-b sub">k=2</td></tr>
+        <tr><td class="mx-cell mx-c-c mut">C16×8</td><td class="mx-cell mx-c-c mut">c</td><td class="mx-cell mx-c-c mut">c</td><td class="mx-cell mx-c-c sub">…</td></tr>
+      </table>
+    </div>
+    <p class="mx-cap">红框每滑一格 = 一次 <code>mma.sync</code>。A 取 16×16 的一块、B 取 16×8 的一块，输出累加到 C 的 16×8。</p>
+    <p style="margin-top:20px">A 用 <code>fp16</code>，累加器 C 用 <code>fp32</code>——这就是"输入半精度、累加全精度"，精度不掉、速度翻好几倍的关键。</p>
 
     <h3>为什么必须先过 smem</h3>
     <p>mma 指令要求输入按 <strong>fragment 布局</strong> 存放——每个 lane 持有的不是连续内存，而是"乱序"的特定位置（如 <code>(g, 2·gid)</code>）。若直接从 global 按这个布局读，会打散合并访存（coalesced）。正确姿势是：先用全体线程按 <code>tid, tid+256, …</code> 连续顺序<strong>合并地</strong>搬进 smem，再从 smem 按 fragment 布局自由索引（smem 带宽高、代价小）。这就是"分块搬 + 按需取"两步走。</p>

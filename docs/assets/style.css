@@ -163,6 +163,118 @@ td.bad { color: var(--warn); }
 }
 .footer a { color: var(--text-dim); }
 
+/* =========================================================================
+   可视化：矩阵网格 + 运动示意（纯 CSS，无 JS 依赖）
+   用法见各 html：<table class="mx" data-i="..." data-j="..." data-k="...">，
+   以及 .anim / .tree / .slide 运动块。
+   ========================================================================= */
+
+/* ---- 语义色：数据 · 计算中 · 目标 · 归约· 掩码 ---- */
+.mx-c-a   { --c: var(--accent);   }   /* A 矩阵 / 输入 */
+.mx-c-b   { --c: var(--accent-2); }   /* B 矩阵 / 权重 */
+.mx-c-c   { --c: #c084fc;         }   /* C 输出 / 结果 */
+.mx-c-m   { --c: var(--text-dim); }   /* 表头 / 静止 */
+.mx-c-hot { --c: #ff6b6b;         }   /* 当前被算到 / 高亮 */
+.mx-c-dim { --c: rgba(154, 164, 178, 0.35); } /* 已归约 / 淡化 */
+
+/* ---- 矩阵网格 ---- */
+.mx {
+  display: inline-grid;
+  gap: 2px;
+  margin: 4px auto;
+  background: transparent;
+  border-collapse: separate;
+}
+.mx-cell {
+  --c: var(--accent);
+  width: 34px; height: 26px;
+  display: flex; align-items: center; justify-content: center;
+  font-family: var(--mono); font-size: 11px;
+  background: color-mix(in srgb, var(--c) 18%, var(--card-2));
+  border: 1px solid color-mix(in srgb, var(--c) 45%, var(--border));
+  border-radius: 3px;
+  color: var(--text);
+}
+.mx-cell.sub { font-size: 9.5px; color: var(--text-dim); background: rgba(255,255,255,0.02); border-style: dashed; }
+.mx-cell.mut { animation: mxPulse 1.6s ease-in-out infinite; }
+@keyframes mxPulse {
+  0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--c) 0%, transparent); }
+  50%      { box-shadow: 0 0 0 3px color-mix(in srgb, var(--c) 55%, transparent); }
+}
+.mx-cap { text-align: center; font-family: var(--mono); font-size: 11px; color: var(--text-dim); margin-top: 6px; }
+
+/* ---- 数据流向箭头（GEMM 搬运 / FA 扫描）---- */
+.move-row { display: flex; align-items: center; justify-content: center; gap: 4px; margin: 12px 0; }
+.move-row .mv { font-family: var(--mono); font-size: 11.5px; color: var(--text-dim); }
+.arrow-c { color: var(--accent); font-size: 15px; font-weight: 700; }
+.ghost {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--accent);
+  display: inline-block;
+  animation: drift 1.4s ease-in-out infinite;
+}
+.ghost.ga { --from: var(--card-2); --to: var(--accent); }
+.ghost.gb { --from: var(--card-2); --to: var(--accent-2); }
+.ghost.gc { --from: var(--card-2); --to: #c084fc; }
+@keyframes drift {
+  0%   { transform: translateX(-6px); opacity: 0; }
+  40%  { opacity: 1; }
+  100% { transform: translateX(6px); opacity: 0; }
+}
+
+/* ---- 归约树 ---- */
+.tree { display: grid; justify-items: center; gap: 12px; margin: 18px 0; }
+.tree .lvl { display: flex; gap: 16px; align-items: center; }
+.tree .node {
+  --c: var(--accent);
+  font-family: var(--mono); font-size: 12px;
+  padding: 6px 14px; border-radius: 8px;
+  background: color-mix(in srgb, var(--c) 18%, var(--card-2));
+  border: 1px solid color-mix(in srgb, var(--c) 50%, var(--border));
+  color: var(--text);
+  animation: treeIn .9s ease both;
+}
+.tree .node.step1 { animation-delay: 0s; }
+.tree .node.step2 { animation-delay: .5s; }
+.tree .node.step3 { animation-delay: 1s; }
+.tree .node.step4 { animation-delay: 1.5s; }
+.tree .node.done { border-color: var(--accent-2); color: var(--accent-2); }
+.tree .branch { color: var(--text-dim); font-size: 11px; }
+@keyframes treeIn { from { opacity: 0; transform: scale(.85); } to { opacity: 1; transform: scale(1); } }
+
+/* ---- 单选块滑过（mma / QKᵀ 归约维）---- */
+.slide { position: relative; display: flex; justify-content: center; margin: 20px 0; }
+.slide .seeker {
+  --c: var(--accent);
+  position: absolute; z-index: 2;
+  width: 34px; height: 26px; top: 0;
+  background: color-mix(in srgb, var(--c) 30%, transparent);
+  border: 2px solid var(--c);
+  border-radius: 4px;
+  box-shadow: 0 0 14px color-mix(in srgb, var(--c) 60%, transparent);
+  animation: seek 2.6s ease-in-out infinite;
+}
+.slide .caption { position: relative; z-index: 1; }
+@keyframes seek {
+  0%   { left: 0%; opacity: .2; }
+  25%  { opacity: 1; }
+  50%  { left: calc(100% - 34px); opacity: 1; }
+  75%  { opacity: 1; }
+  100% { left: 0%; opacity: .2; }
+}
+
+/* ---- online softmax 状态行 ---- */
+.oshare { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; margin: 16px 0; }
+.oshare .chip {
+  font-family: var(--mono); font-size: 12px;
+  background: var(--card-2); border: 1px solid var(--border);
+  border-radius: 8px; padding: 8px 12px; min-width: 96px; text-align: center;
+}
+.oshare .chip b { display: block; font-size: 11px; color: var(--text-dim); font-weight: 600; }
+.oshare .chip span { font-size: 13px; color: #fff; }
+.oshare .chip .new { color: var(--accent-3); animation: mxPulse 1.2s ease-in-out infinite; }
+.oshare .chip .alpha { color: var(--accent-2); }
+
 @media (max-width: 640px) {
   .wrap { padding: 24px 16px 60px; }
   .topbar { padding: 10px 16px; gap: 10px; }

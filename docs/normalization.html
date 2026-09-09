@@ -45,6 +45,35 @@
     <span class="node">广播 + 归一化写回</span>
   </div>
 
+  <p><strong>归约树长什么样</strong>——以一行 8 个元素为例，先求它们的 <code>max</code>（Softmax 第一步用的就是它）：每轮两两取大，层数减半，从 8 个值减到 1 个标量。</p>
+  <div class="tree">
+    <div class="lvl">
+      <span class="node step1">7</span>
+      <span class="node step1">3</span>
+      <span class="node step1">9</span>
+      <span class="node step1">1</span>
+      <span class="node step1">5</span>
+      <span class="node step1">8</span>
+      <span class="node step1">2</span>
+      <span class="node step1">6</span>
+    </div>
+    <span class="branch">两两取 max ↓</span>
+    <div class="lvl">
+      <span class="node step2 done">7</span>
+      <span class="node step2 done">9</span>
+      <span class="node step2 done">8</span>
+      <span class="node step2 done">6</span>
+    </div>
+    <span class="branch">再取 max ↓</span>
+    <div class="lvl">
+      <span class="node step3 done">9</span>
+      <span class="node step3 done">8</span>
+    </div>
+    <span class="branch">↓</span>
+    <div class="lvl"><span class="node step4 done">9</span></div>
+  </div>
+  <p class="mx-cap">8 个元素只需 3 层就归约成一个标量（并行度每层减半）。256 个线程就是把同样的树挖深 8 层。</p>
+
   <h2>二、归约的两种手段（骨架核心）</h2>
   <h3>块内树形归约（256 → 32）</h3>
   <pre>for (int s = BLOCK/2; s >= 32; s >>= 1) {
@@ -71,6 +100,12 @@
     <p><strong>为什么减 max</strong>：直接算 <code>exp(x_i)</code> 会在 x_i 稍大时上溢（exp(90) 已超 fp32 范围）。减掉行最大值后指数 ≤ 0，值域稳定在 (0,1]，这是数值安全版的标准写法学。</p>
     <p><strong>为什么是两次归约</strong>：softmax 需要两个统计量——先扫一遍求 <code>max</code>（第一次归约），再扫一遍求 <code>Σ exp(x-max)</code>（第二次归约），最后第三次写回归一化值。两次归约之间有<strong>数据依赖</strong>（求和需要先知道 max），所以是串行的两轮。</p>
     <p><strong>特点</strong>：纯逐元素，不引入额外可学习参数。fused 到单个 kernel，中间结果（exp 值）不再写回全局内存。</p>
+    <p><strong>在一行上收什么</strong>（下半部分那条向量就是一整行数据）：</p>
+    <table class="mx" style="grid-template-columns: repeat(8, 34px);">
+      <tr><td class="mx-cell mx-c-a mut" colspan="2">x</td><td class="mx-cell mx-c-a mut" colspan="2">x</td><td class="mx-cell mx-c-a mut" colspan="2">x</td><td class="mx-cell mx-c-a mut" colspan="2">x</td></tr>
+      <tr><td class="mx-cell mx-c-hot sub">max</td><td class="mx-cell mx-c-hot sub">max</td><td class="mx-cell mx-c-hot sub">max</td><td class="mx-cell mx-c-hot sub">max</td><td class="mx-cell mx-c-b sub">Σexp</td><td class="mx-cell mx-c-b sub">Σexp</td><td class="mx-cell mx-c-b sub">Σexp</td><td class="mx-cell mx-c-b sub">Σexp</td></tr>
+    </table>
+    <p class="mx-cap">先整行归约出 <span style="color:#ff6b6b">max</span>（第 1 趟），再用它归约出 <span style="color:var(--accent-2)">Σexp(x-max)</span>（第 2 趟）——因为第 2 趟要用第 1 趟的结果，所以两趟是<strong>串行</strong>的。</p>
   </div>
 
   <div class="op">
@@ -83,6 +118,12 @@
     <p><strong>为什么也是两次归约</strong>：第一次归约求 <code>Σx</code> 得 mean；第二次归约求 <code>Σ(x-mean)²</code> 得 var。后者依赖前者（方差要用均值），所以同样是串行两轮。</p>
     <p><strong>关键实现巧思</strong>：求方差那轮循环里，先把差值 <code>d = x - mean</code> 顺便<strong>暂存</strong>到输出数组 <code>ry[idx] = d</code>，最后一轮拿到 <code>inv = rsqrt(var+eps)</code> 后直接 <code>ry[idx] *= inv</code>——<strong>省掉一次全局显存读</strong>（不用再读一遍 x）。</p>
     <p><strong>与 softmax 的区别</strong>：都有两次依赖归约，但 softmax 归约的是 max 与 sum-of-exp，layernorm 归约的是 sum 与 sum-of-sq；layernorm 引入了"暂存差值"以减少写回。</p>
+    <p><strong>在一行上收什么</strong>：</p>
+    <table class="mx" style="grid-template-columns: repeat(8, 34px);">
+      <tr><td class="mx-cell mx-c-a mut" colspan="2">x</td><td class="mx-cell mx-c-a mut" colspan="2">x</td><td class="mx-cell mx-c-a mut" colspan="2">x</td><td class="mx-cell mx-c-a mut" colspan="2">x</td></tr>
+      <tr><td class="mx-cell mx-c-hot sub">Σx</td><td class="mx-cell mx-c-hot sub">Σx</td><td class="mx-cell mx-c-hot sub">Σx</td><td class="mx-cell mx-c-hot sub">Σx</td><td class="mx-cell mx-c-b sub">Σd²</td><td class="mx-cell mx-c-b sub">Σd²</td><td class="mx-cell mx-c-b sub">Σd²</td><td class="mx-cell mx-c-b sub">Σd²</td></tr>
+    </table>
+    <p class="mx-cap">先归约出 <span style="color:#ff6b6b">mean = Σx/N</span>（第 1 趟），再归约 <span style="color:var(--accent-2)">var = Σ(x-mean)²/N</span>（第 2 趟）。第二行里其实不存 d=x-mean 的八个格子，而是算的时候顺手复用。</p>
   </div>
 
   <div class="op v-highlight">
@@ -100,6 +141,12 @@
     </ul>
     <p><strong>为什么引入 g（gamma）</strong>：可学习缩放参数。LLM 里大模型（LLaMA、Qwen、Mistral）发现去掉 centering 只保留缩放几乎不损精度、还更快，于是 RMSNorm 成为大模型标配。g 推理时也要乘。</p>
     <p><strong>代码形态</strong>：与 layernorm 几乎同构，就是把"两轮归约"删成"一轮"（<code>sum_sq = Σ rx²</code> → 一次树形 + warp 归约 → <code>inv = rsqrtf(s[0]/N + eps)</code> → 写回 <code>x · inv · g</code>）。</p>
+    <p><strong>在一行上收什么——只有一趟</strong>：</p>
+    <table class="mx" style="grid-template-columns: repeat(8, 34px);">
+      <tr><td class="mx-cell mx-c-a mut" colspan="2">x</td><td class="mx-cell mx-c-a mut" colspan="2">x</td><td class="mx-cell mx-c-a mut" colspan="2">x</td><td class="mx-cell mx-c-a mut" colspan="2">x</td></tr>
+      <tr><td class="mx-cell mx-c-hot sub" colspan="8">Σ x² 　（没有第二趟！）</td></tr>
+    </table>
+    <p class="mx-cap">对比上面 LayerNorm 的两行、Softmax 的两行——RMSNorm <strong>从头到尾只有一次归约</strong>：没有 mean，自然也没有 var 那趟依赖。这就是它比 LayerNorm 快、又几乎不掉精度的根源。</p>
   </div>
 
   <h2>四、三者区别总览</h2>
