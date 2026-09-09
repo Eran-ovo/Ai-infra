@@ -185,6 +185,15 @@ td.bad { color: var(--warn); }
   background: transparent;
   border-collapse: separate;
 }
+/* 关键修复：HTML 用 <table><tr><td>，但 .mx 是 grid。
+   <tr> 若保留保留 table-row display，会被当成单个 grid 项，
+   把整行 <td> 挤进首列 → 只显示第一列。
+   用 display:contents 让 <tr> 不生成盒子，<td> 直接成为 grid 项，
+   按 grid-template-columns 正确排布成多列。 */
+.mx tr { display: contents; }
+/* grid 不认 HTML 的 colspan，用属性选择器把跨度映射成 grid-column */
+.mx td[colspan="2"] { grid-column: span 2; }
+.mx td[colspan="8"] { grid-column: span 8; }
 .mx-cell {
   --c: var(--accent);
   width: 34px; height: 26px;
