@@ -23,8 +23,11 @@
 
   <div class="hero">
     <h1>PyTorch 封装：把手写 kernel 变成 torch 算子</h1>
-    <p class="sub">把 kernels/ 下 5 个手写算子（GEMM / Softmax / LayerNorm / RMSNorm / FlashAttention）统一封装成一个 PyTorch Extension 模块 ai_infra_ops —— 工业界标准的 CUDA → PyTorch 落地流程。</p>
+    <p class="sub">把 kernels/ 下 5 类手写算子（GEMM / Softmax / LayerNorm / RMSNorm / FlashAttention）统一封装成一个 PyTorch Extension 模块 ai_infra_ops —— 工业界标准的 CUDA → PyTorch 落地流程。</p>
   </div>
+
+      <div class="definition"><b>先区分“5 类”和“7 个函数”：</b>这里有 5 类能力，但 GEMM 和 FlashAttention 都提供 baseline 与 Tensor Core 入口，所以绑定层一共暴露 7 个 Python 函数。</div>
+  <div class="key-answer"><b>这一层解决的不是算法问题，而是边界问题：</b>Python 的 Tensor 如何验证、如何取到底层指针、如何配置 grid/block、如何把 CUDA 错误和结果安全地交还给 Python。真正的计算仍发生在 <code>.cu</code> kernel 中。</div>
 
   <h2>一、为什么需要这一层：kernel 只是"半成品"</h2>
   <p><code>kernels/</code> 里的算子都是<strong>独立的 <code>main()</code></strong>：自己 malloc、自己喂数据、自己对拍。它们是学习/验证用的，<strong>无法被 Python 直接调用</strong>。
@@ -37,17 +40,39 @@
     <span class="node">import ai_infra_ops</span>
   </div>
 
-  <h2>二、目录结构与职责分工</h2>
+  <h2>二、一次 Python 调用到底发生了什么</h2>
+  <div class="steps">
+    <div class="step"><b>进入绑定函数：</b><code>m.def(...)</code> 把 Python 参数转换成 C++ 的 <code>torch::Tensor</code>、<code>double</code> 或 <code>bool</code>。</div>
+    <div class="step"><b>检查契约：</b><code>TORCH_CHECK</code> 验证设备、dtype、维度、形状和连续性；失败时抛出 Python 可见的异常，不让非法指针进入 kernel。</div>
+    <div class="step"><b>准备输出与参数：</b>包装层根据输入 shape 创建输出 Tensor，并从 Tensor 读取 <code>data_ptr&lt;T&gt;()</code>、M/N/K 或 N 等 launch 参数。</div>
+    <div class="step"><b>启动 CUDA：</b>计算 grid/block 后调用 <code>&lt;&lt;&lt;grid, block&gt;&gt;&gt;</code>；kernel 在 GPU stream 上执行，包装函数返回一个仍由 PyTorch 管理生命周期的 Tensor。</div>
+  </div>
+  <p class="definition"><b>生命周期为什么安全：</b>输出由 <code>torch::empty</code>/<code>empty_like</code> 创建，底层内存由 PyTorch allocator 管理；包装层只在 kernel 执行期间借用裸指针，不负责手动 <code>malloc/free</code>。</p>
+
+  <h2>三、目录结构与职责分工</h2>
   <table>
     <tr><th>文件</th><th>职责</th></tr>
     <tr><td><code>setup.py</code></td><td><code>CUDAExtension</code> 单模块构建，指定 <code>extra_cuda_cflags=["-O3"]</code></td></tr>
     <tr><td><code>csrc/ops.h</code></td><td>所有 forward 入口函数的声明，屏蔽 .cu/.cpp 间重复</td></tr>
-    <tr><td><code>csrc/bindings.cpp</code></td><td><code>PYBIND11_MODULE</code> 把 6 个 forward 暴露成 Python 函数</td></tr>
+    <tr><td><code>csrc/bindings.cpp</code></td><td><code>PYBIND11_MODULE</code> 把 7 个 forward 暴露成 Python 函数</td></tr>
     <tr><td><code>csrc/*_cuda.cu</code></td><td>每个算子 = 一个 CUDA kernel + 一个 torch::Tensor 包装函数</td></tr>
     <tr><td><code>test_all.py</code></td><td>正确性对拍（vs torch 原生）+ 性能 benchmark（交错计时）</td></tr>
   </table>
 
-  <h2>三、每个算子的三层结构（以 RMSNorm 为例）</h2>
+  <h3>七个入口的输入输出契约</h3>
+  <table>
+    <tr><th>Python 入口</th><th>输入</th><th>输出</th><th>实现边界</th></tr>
+    <tr><td><code>rmsnorm(x, g, eps)</code></td><td><code>x [B,N]</code>、<code>g [N]</code>，CUDA fp32</td><td>fp32 <code>[B,N]</code></td><td>逐行 RMSNorm，带 gamma</td></tr>
+    <tr><td><code>softmax(x)</code></td><td>CUDA contiguous fp32 <code>[B,N]</code></td><td>fp32 <code>[B,N]</code></td><td>沿最后一维做 softmax</td></tr>
+    <tr><td><code>layernorm(x, eps)</code></td><td>CUDA contiguous fp32 <code>[B,N]</code></td><td>fp32 <code>[B,N]</code></td><td>无 affine 的 LayerNorm</td></tr>
+    <tr><td><code>gemm(a,b)</code></td><td><code>a [M,K]</code>、<code>b [K,N]</code>，CUDA contiguous fp32</td><td>fp32 <code>[M,N]</code></td><td>32×32 tiled kernel</td></tr>
+    <tr><td><code>gemm_mma(a,b)</code></td><td>同形状，CUDA contiguous fp16</td><td>fp32 <code>[M,N]</code></td><td>手写 <code>mma.sync</code>，sm_86 目标</td></tr>
+    <tr><td><code>flashattention(q,k,v,causal)</code></td><td>三者同形状 <code>[N,64]</code>，CUDA contiguous fp32</td><td>fp32 <code>[N,64]</code></td><td>v3 结构，head dim 固定 64</td></tr>
+    <tr><td><code>flashattention_fp16(q,k,v,causal)</code></td><td>三者同形状 <code>[N,64]</code>，CUDA contiguous fp16</td><td>fp16 <code>[N,64]</code></td><td>v4 Tensor Core，支持 tail + causal，head dim 固定 64</td></tr>
+  </table>
+  <p class="definition"><b>形状符号不要混淆：</b>归一化里的 <code>N</code> 是一行的特征数；attention 里的 <code>N</code> 是 token 数、64 是 head dimension；GEMM 里的 <code>M/N/K</code> 分别是输出行数、输出列数和归约长度。</p>
+
+  <h2>四、每个算子的三层结构（以 RMSNorm 为例）</h2>
   <p>每个算子都是一模一样的三段：<strong>kernel 不变 + 加一层 Tensor 包装</strong>。kernel 主体直接照搬 <code>kernels/rmsnorm_v1.cu</code>，差异只在输入输出从裸指针换成 <code>torch::Tensor</code>。</p>
 
   <h3>第 1 层：CUDA kernel（同源，几乎不改）</h3>
@@ -76,7 +101,7 @@
     m.def("rmsnorm", &rmsnorm_forward, "RMSNorm forward (CUDA)");
 }</pre>
 
-  <h2>四、面试关键点（这层最常被问）</h2>
+  <h2>五、面试关键点（这层最常被问）</h2>
   <div class="op">
     <div class="op-head"><span class="op-title">1. TORCH_CHECK 防御性校验</span></div>
     <ul>
@@ -99,7 +124,7 @@
 
   <div class="op">
     <div class="op-head"><span class="op-title">4. 单一模块 vs 多 .so</span></div>
-    <p>一个 <code>ai_infra_ops</code> 模块暴露全部 6 个算子，而不是每个算子一个共享库。工业界（FlashAttention 官方 repo、DeepSpeed op）都这么做：</p>
+    <p>一个 <code>ai_infra_ops</code> 模块暴露全部 7 个 Python 函数，而不是每个算子一个共享库。工业界（FlashAttention 官方 repo、DeepSpeed op）都这么做：</p>
     <ul>
       <li>一次 <code>import</code> 全部可用，编译一次而非 N 次；</li>
       <li>共享符号与头文件，operator 间可互相复用代码。</li>
@@ -122,7 +147,8 @@ else        flash_fwd&lt;false&gt;&lt;&lt;&lt;grid, Br&gt;&gt;&gt;(...);</pre>
     </ul>
   </div>
 
-  <h2>五、实测结果（RTX 3060 Laptop，test_all.py 复现）</h2>
+  <h2>六、实测结果（RTX 3060 Laptop，test_all.py 复现）</h2>
+  <p>下表比较的是同一输入规模下的端到端 kernel 时间；加速比按“PyTorch 原生时间 ÷ 手写时间”计算。它用于说明优化方向，不是对所有 batch、特征维度和 GPU 的普遍保证。</p>
   <table>
     <tr><th>算子</th><th>手写 CUDA</th><th>PyTorch 原生</th><th>加速比</th><th>结论</th></tr>
     <tr><td>RMSNorm (B=1024 N=1024)</td><td class="num">0.031 ms</td><td class="num">0.156 ms</td><td class="num good">4.97x</td><td>fused 少写回中间结果</td></tr>
@@ -130,12 +156,13 @@ else        flash_fwd&lt;false&gt;&lt;&lt;&lt;grid, Br&gt;&gt;&gt;(...);</pre>
     <tr><td>LayerNorm (B=1024 N=1024)</td><td class="num">0.040 ms</td><td class="num">0.125 ms</td><td class="num good">3.11x</td><td>同上</td></tr>
     <tr><td>GEMM (1024³)</td><td class="num">3.04 ms</td><td class="num">0.33 ms (cuBLAS)</td><td class="num bad">0.11x</td><td>手写 tiled vs cuBLAS 真实差距</td></tr>
     <tr><td>GEMM mma fp16 (1024³)</td><td class="num">0.542 ms</td><td class="num">0.237 ms (cuBLAS fp16)</td><td class="num bad">0.44x</td><td>Tensor Core 后差距从 13x 缩到 2.3x</td></tr>
-    <tr><td>FlashAttention (N=8192 D=64)</td><td class="num">causal 9.95 ms</td><td class="num">—</td><td class="num good">causal 2.06x</td><td>GPU 结果整一会写回</td></tr>
+    <tr><td>FlashAttention (N=8192 D=64)</td><td class="num">causal 9.95 ms</td><td class="num">—</td><td class="num good">causal 2.06x</td><td>中间结果不落显存，结果只写回一次</td></tr>
   </table>
 
   <div class="note"><b>为什么归一化类能赢、GEMM 输得惨</b>：归一化（RMSNorm/LayerNorm）是 <em>memory-bound</em> 问题——手写 fused 一次加载一次写回，天然赢过 PyTorch 拆成 pow→mean→rsqrt→mul 的多次读写；而 GEMM 是 <em>compute-bound</em>，对手是 cuBLAS 的 Tensor Core + 深度流水线，手写 tiled 不换硬件必输。一胜一负，恰好印证「优化要先分清 bound 类型」。</div>
 
-  <h2>六、编译与使用</h2>
+  <h2>七、编译与使用</h2>
+  <p>编译阶段生成带有 CUDA kernel 的共享库；运行阶段只需导入它。两者是不同问题：改了 <code>.cu</code> 或 CUDA/PyTorch 环境要重新编译，普通 Python 调用不会再次编译。</p>
   <pre>cd torch_ext
 export PATH=/usr/local/cuda/bin:$PATH
 export TORCH_CUDA_ARCH_LIST="8.6"
@@ -148,6 +175,14 @@ ai_infra_ops.layernorm(x, eps)           # x [B,N] fp32，无 affine
 ai_infra_ops.gemm(a, b)                  # a [M,K] b [K,N] fp32 -> fp32（tiled）
 ai_infra_ops.gemm_mma(a, b)              # a [M,K] b [K,N] fp16 -> fp32（手写 Tensor Core）
 ai_infra_ops.flashattention(q, k, v, causal)  # q/k/v [N,64] fp32</pre>
+
+  <h3>遇到报错时按这个顺序排查</h3>
+  <div class="steps">
+    <div class="step"><b>设备：</b>确认输入位于 CUDA，且当前 GPU 支持目标架构；CPU Tensor 会在入口的 <code>TORCH_CHECK</code> 处被拒绝。</div>
+    <div class="step"><b>类型与形状：</b>确认 fp32/fp16 要求、二维 shape、GEMM 的内维相等，以及 FlashAttention 的最后一维确实为 64。</div>
+    <div class="step"><b>连续性：</b>对转置或切片结果调用 <code>.contiguous()</code>；仅仅 shape 看起来正确，并不代表底层地址是线性排列。</div>
+    <div class="step"><b>性能：</b>先 warm-up，再用 CUDA event 计时；首次调用还可能包含 lazy initialization，不能拿它和稳态平均值直接比较。</div>
+  </div>
 
   <div class="footer">
     <span>cuda-kernels · PyTorch 封装节</span>

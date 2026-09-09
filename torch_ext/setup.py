@@ -1,7 +1,7 @@
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
-# 一个模块 ai_infra_ops 暴露全部 5 个算子（工业界标准：一个共享库，多个 forward）
+# 一个模块 ai_infra_ops 暴露多类算子（工业界标准：一个共享库，多个 forward）
 setup(
     name="ai_infra_ops",
     ext_modules=[
@@ -15,6 +15,7 @@ setup(
                 "csrc/gemm_cuda.cu",
                 "csrc/gemm_mma_cuda.cu",       # fp16 Tensor Core GEMM（手写 mma.sync）
                 "csrc/flashattention_cuda.cu",
+                "csrc/flashattention_mma_cuda.cu",  # FlashAttention v4（fp16 Tensor Core）
             ],
             extra_cuda_cflags=["-O3"],
         )

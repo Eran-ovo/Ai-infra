@@ -32,6 +32,13 @@
   <div class="formula">C[i][j] = Σ_{k=0}^{K-1} A[i][k] · B[k][j]
 工作量   = 2·M·N·K 次浮点运算（M·N 个元素 × K 次乘加 × 2）</div>
 
+  <div class="definition"><b>先把下标读顺：</b>固定输出位置 <code>C[i][j]</code> 后，<code>i</code> 选 A 的第 i 行，<code>j</code> 选 B 的第 j 列；<code>k</code> 同时在 A 的列和 B 的行上移动，把一对数相乘后累加。只有 A 的列数与 B 的行数（这里都是 K）必须相等。</div>
+  <div class="steps">
+    <div class="step"><b>选一个输出格子：</b>线程或线程组先决定自己负责的 <code>(i, j)</code>，也就是 C 的一个元素或一个小块。</div>
+    <div class="step"><b>沿 K 维累加：</b>读取 <code>A[i][k]</code> 与 <code>B[k][j]</code>，做 K 次乘加；K 是归约维，不会出现在 C 的形状里。</div>
+    <div class="step"><b>写回结果：</b>所有 K 项累加结束后，只把 <code>C[i][j]</code> 写回全局内存。</div>
+  </div>
+
   <div class="slide">
     <div class="seeker" style="--c:#ff6b6b"></div>
     <table class="mx" style="grid-template-columns: repeat(4, 34px);">
@@ -42,16 +49,23 @@
   </div>
   <p class="mx-cap">C 的每个格子 c[i][j] 都要"读一整行 A、读一整列 B"来累加。</p>
 
-  <h2>二、核心矛盾：算力富裕，带宽不足</h2>
-  <p>GEMM 是一个 <em>compute-bound</em> 问题——算术强度（每字节访存能换来的浮点运算）非常高。
-  朴素实现的真正瓶颈不是"算不过来"，而是<strong>数据喂不饱计算单元</strong>：每个 C 元素要读 2K 个数，K 越大，重复读 A、B 的次数越多，全局内存带宽成了天花板。</p>
-  <p>所以五个版本的优化主线是同一件事：<strong>把会被反复读的数据，搬到离计算单元更近、更快的地方</strong>。加载一次、复用多次。</p>
+  <h2>二、核心矛盾：重复访存与计算吞吐</h2>
+  <p>GEMM 的总工作量很大，但同一份 A/B 数据会被许多输出元素反复使用。v0 让每个线程独立从 global memory 取数，结果是<strong>计算逻辑正确，却没有把数据复用起来</strong>；当数据搬运跟不上时，计算单元就会空等。</p>
+  <p>从 v1 开始，优化主线是：<strong>把会被反复读的数据，搬到离计算单元更近、更快的地方</strong>，加载一次、复用多次；到 v4 再进一步，使用 Tensor Core 提升单位时间内的乘加数量。因此“GEMM 是 compute-bound”描述的是经过良好分块后的典型形态，而不是说 v0 的访问方式已经高效。</p>
   <div class="flow">
     <span class="node">HBM (DRAM)</span><span class="arrow">→</span>
     <span class="node">Shared Memory</span><span class="arrow">→</span>
     <span class="node">寄存器</span><span class="arrow">→</span>
     <span class="node">计算单元</span>
   </div>
+  <div class="key-answer"><b>为什么一个 32×32 tile 有用？</b> A 的一个 tile 会被同一 block 中多行 C 复用，B 的一个 tile 会被多列 C 复用。global memory 负责把 tile 搬进来，之后的 K 次内层乘加主要读 shared memory；这正是“分块”带来的收益。</div>
+
+  <h3>线程、block 与矩阵坐标如何对应</h3>
+  <p>v1/v2 使用 <code>block(TILE, TILE)</code>。因此一个 block 覆盖 C 的一个 <code>32×32</code> 区域：<code>blockIdx.y</code> 决定行块，<code>blockIdx.x</code> 决定列块，<code>threadIdx.y/x</code> 决定块内坐标。</p>
+  <pre>row = blockIdx.y * TILE + threadIdx.y;  // C 的行 i
+col = blockIdx.x * TILE + threadIdx.x;  // C 的列 j
+C[row][col] = Σk A[row][k] * B[k][col];</pre>
+  <p>当 K 大于 TILE 时，<code>t</code> 循环依次加载 K 维上的小块；两次 <code>__syncthreads()</code> 分别表示“tile 已搬完，可以读”和“tile 已用完，可以覆盖”。这两个同步点是正确性的边界，不是装饰。</p>
 
   <h2>三、逐版原理</h2>
 
@@ -93,7 +107,7 @@ for (int t = 0; t < K/TILE; ++t) {
       <span class="arrow-c">→</span>
       <span class="mv">32 线程从这重复读</span>
     </div>
-    <p>下面这块 6×6 就是搬进 smem 的一个 tile：<strong>搬一次，块内 16×16 个线程反复读它算各自的 C</strong>——这是"加载一次、复用多次"的全部含义。</p>
+    <p>下面这块 6×6 是为了示意一个搬进 smem 的 tile：<strong>搬一次，块内 32×32 个线程反复读取其中的数据，分别计算自己的 C</strong>——这是“加载一次、复用多次”的全部含义。</p>
     <table class="mx" style="grid-template-columns: repeat(6, 34px);">
       <tr><td class="mx-cell mx-c-a">a</td><td class="mx-cell mx-c-a">a</td><td class="mx-cell mx-c-a">a</td><td class="mx-cell mx-c-a">a</td><td class="mx-cell mx-c-a">a</td><td class="mx-cell mx-c-a">a</td></tr>
       <tr><td class="mx-cell mx-c-a">a</td><td class="mx-cell mx-c-a">a</td><td class="mx-cell mx-c-a">a</td><td class="mx-cell mx-c-a">a</td><td class="mx-cell mx-c-a">a</td><td class="mx-cell mx-c-a">a</td></tr>
@@ -188,6 +202,8 @@ gemm_op(args);</pre>
       <li><strong>测量口径</strong>：单次 0.754ms vs 20 次平均 0.448ms 差异大——首次启动有冷缓存/未达稳态频率的开销，两种口径都要记录，避免"到底多少 GFLOPS"的歧义。</li>
     </ul>
   </div>
+
+  <div class="definition"><b>性能数字怎么来的：</b>对方阵 GEMM，<code>GFLOPS = 2·M·N·K / 时间(秒) / 10⁹</code>。GFLOPS 只说明吞吐，不等于“任何形状都一样快”；本文数字固定在对应的矩阵尺寸、数据类型和预热/计时口径下比较。</div>
 
   <h2>四、五版区别总览</h2>
   <table>

@@ -11,7 +11,8 @@
 //   - S = Q @ K^T（mma，A=Q row-major，B=K^T）；P = exp(S-m)；O = P @ V（mma）
 //   - 在线 softmax：running max/sum 每行维护，行内 4-lane 蝶形 shuffle 归约
 //
-// Stage 1：全 attention（非 causal），Bq=Bc=D=64 固定，N 可被 64 整除为纯最小实现。
+// Stage 2：full/causal attention，Bq=Bc=D=64 固定；K/V 尾块与 causal 未来位置
+// 都通过 score mask 处理，N 可以不是 64 的倍数。
 // ---------------------------------------------------------------------------
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -58,6 +59,7 @@ __device__ __forceinline__ void load_A_verified(__half2& a0, __half2& a1, __half
     a3 = __halves2half2(M[r + g + 8][c + gid * 2 + 8], M[r + g + 8][c + gid * 2 + 9]);
 }
 
+template<bool IS_CAUSAL>
 __global__ void flash_fp16_mma(const __half* __restrict__ Q,
                                const __half* __restrict__ K,
                                const __half* __restrict__ V,
@@ -99,7 +101,9 @@ __global__ void flash_fp16_mma(const __half* __restrict__ Q,
                 o_acc[ii][t][i] = 0.0f;
 
     const float scale = 1.0f / sqrtf((float)D);
-    const int num_kv = (N + Bc - 1) / Bc;
+    const int q_last = (q_off + Bq - 1 < N) ? (q_off + Bq - 1) : (N - 1);
+    // causal 模式不需要加载当前 Q block 之后的 KV block。
+    const int num_kv = IS_CAUSAL ? (q_last / Bc + 1) : (N + Bc - 1) / Bc;
 
     for (int kv = 0; kv < num_kv; ++kv) {
         const int k_off = kv * Bc;
@@ -135,6 +139,44 @@ __global__ void flash_fp16_mma(const __half* __restrict__ Q,
             }
         }
 
+        // ---- K/V 尾块 + causal mask ----------------------------------------
+        //
+        // 当 N 不是 Bc 的倍数时，Ks/Vs 的越界行虽然被零填充，但不能让它们
+        // 继续参与 softmax：零 K 会产生 score=0，进而给 padding token 分配
+        // 非零概率，错误地增大 softmax 分母。必须在 max/sum 归约前把对应
+        // score 设为 -inf，使 exp(-inf)=0。causal 模式还要屏蔽 key_col > qrow
+        // 的未来 token；这个判断在编译期模板中会被 full 模式消掉。
+        //
+        // 一个 MMA fragment 中：
+        //   S[t][0], S[t][1] -> 第 g 行，两个连续的 key 列
+        //   S[t][2], S[t][3] -> 第 g+8 行，同样的两个 key 列
+        // t * WMMA_N + gid * 2 是当前 lane 的列起点。
+        #pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            const int key_col0 = k_off + t * WMMA_N + gid * 2;
+            const int key_col1 = key_col0 + 1;
+            const int qrow0 = q_off + ar + g;
+            const int qrow1 = qrow0 + 8;
+
+            const bool invalid00 = key_col0 >= N || (IS_CAUSAL && key_col0 > qrow0);
+            const bool invalid01 = key_col1 >= N || (IS_CAUSAL && key_col1 > qrow0);
+            const bool invalid10 = key_col0 >= N || (IS_CAUSAL && key_col0 > qrow1);
+            const bool invalid11 = key_col1 >= N || (IS_CAUSAL && key_col1 > qrow1);
+
+            if (invalid00) {
+                S[t][0] = -INFINITY;
+            }
+            if (invalid01) {
+                S[t][1] = -INFINITY;
+            }
+            if (invalid10) {
+                S[t][2] = -INFINITY;
+            }
+            if (invalid11) {
+                S[t][3] = -INFINITY;
+            }
+        }
+
         // ---- 在线 softmax：行内归约（完全 warp 内）------------------------
         #pragma unroll
         for (int t = 0; t < 8; ++t)
@@ -142,17 +184,21 @@ __global__ void flash_fp16_mma(const __half* __restrict__ Q,
             for (int i = 0; i < 4; ++i)
                 S[t][i] *= scale;
 
+        //一个线程组负责两行的归约，m_prev/l_prev是上一轮的状态
         const float m_old0 = m_prev[0], m_old1 = m_prev[1];
         const float l_old0 = l_prev[0], l_old1 = l_prev[1];
 
         // 行 g 的 max（c0,c1 是行 g 的 2x gid 列）
         float rm0 = -1e20f;
+        //每个线程在自己负责的第g行的16个元素挑出最大值，四个线程就有4个最大值
         #pragma unroll
         for (int t = 0; t < 8; ++t) {
             rm0 = fmaxf(rm0, fmaxf(S[t][0], S[t][1]));
         }
+        //__shfl_xor_sync(0xffffffff, rm0, 1)两两交换相邻线程的rm0值，之后取最大值
         rm0 = fmaxf(rm0, __shfl_xor_sync(0xffffffff, rm0, 1));
-        rm0 = fmaxf(rm0, __shfl_xor_sync(0xffffffff, rm0, 2));
+        //__shfl_xor_sync(0xffffffff, rm0, 2)两两交换间隔线程的rm0值，之后取最大值
+        rm0 = fmaxf(rm0, __shfl_xor_sync(0xffffffff, rm0, 2));//此时的rm0就是行g的最大值
 
         // 行 g+8 的 max（c2,c3 是行 g+8 的列）
         float rm1 = -1e20f;
@@ -244,13 +290,17 @@ __global__ void flash_fp16_mma(const __half* __restrict__ Q,
 
 // CPU 参考：fp32 输入（喂 fp16 量化后的数据），fp32 累加，减 max 稳定
 static void attn_cpu(const float* Q, const float* K, const float* V,
-                     float* O, int N) {
+                     float* O, int N, bool causal) {
     const float scale = 1.0f / sqrtf((float)D);
     #pragma omp parallel for
     for (int i = 0; i < N; ++i) {
         float m = -1e20f;
         float* srow = (float*)malloc(N * sizeof(float));
         for (int j = 0; j < N; ++j) {
+            if (causal && j > i) {
+                srow[j] = -INFINITY;
+                continue;
+            }
             float s = 0.0f;
             for (int d = 0; d < D; ++d) s += Q[i * D + d] * K[j * D + d];
             srow[j] = s * scale;
@@ -267,8 +317,10 @@ static void attn_cpu(const float* Q, const float* K, const float* V,
     }
 }
 
+#ifndef FLASHATTENTION_V4_NO_MAIN
 int main() {
-    for (int N : {64, 128, 256, 512, 1024, 2048, 4096}) {
+    // 特别覆盖 K/V 尾块：65、127、129 都不是 64 的倍数。
+    for (int N : {1, 7, 63, 64, 65, 127, 128, 129, 256, 512, 1024, 2048, 4096}) {
         const size_t hB = (size_t)N * D * 2;   // half
         const size_t fB = (size_t)N * D * 4;   // float
         float* hQf = (float*)malloc(fB);
@@ -288,7 +340,7 @@ int main() {
         }
         for (int i = 0; i < N * D; ++i) { hQ[i] = __float2half(hQf[i]); hK[i] = __float2half(hKf[i]); hV[i] = __float2half(hVf[i]); }
         for (int i = 0; i < N * D; ++i) { hQf[i] = __half2float(hQ[i]); hKf[i] = __half2float(hK[i]); hVf[i] = __half2float(hV[i]); }
-        attn_cpu(hQf, hKf, hVf, hRef, N);
+        // hRef 会在下面的 full/causal 两次对拍中分别生成。
 
         __half *dQ, *dK, *dV, *dO;
         cudaMalloc(&dQ, hB); cudaMalloc(&dK, hB); cudaMalloc(&dV, hB); cudaMalloc(&dO, hB);
@@ -297,35 +349,54 @@ int main() {
         cudaMemcpy(dV, hV, hB, cudaMemcpyHostToDevice);
 
         const int grid = (N + Bq - 1) / Bq;
-        flash_fp16_mma<<<grid, WARPS * 32>>>(dQ, dK, dV, dO, N);
-        cudaDeviceSynchronize();
-        cudaError_t err = cudaGetLastError();
-        if (err != cudaSuccess) { printf("N=%4d CUDA error: %s\n", N, cudaGetErrorString(err)); return 1; }
+        for (int causal = 0; causal <= 1; ++causal) {
+            attn_cpu(hQf, hKf, hVf, hRef, N, causal != 0);
 
-        // 计时（预热 + 多轮平均，与仓库其他 benchmark 同口径）
-        cudaEvent_t s, e;
-        cudaEventCreate(&s); cudaEventCreate(&e);
-        for (int i = 0; i < 5; ++i) flash_fp16_mma<<<grid, WARPS * 32>>>(dQ, dK, dV, dO, N);
-        cudaDeviceSynchronize();
-        cudaEventRecord(s);
-        for (int i = 0; i < 50; ++i) flash_fp16_mma<<<grid, WARPS * 32>>>(dQ, dK, dV, dO, N);
-        cudaEventRecord(e); cudaEventSynchronize(e);
-        float ms = 0; cudaEventElapsedTime(&ms, s, e); ms /= 50;
+            auto launch = [&]() {
+                if (causal)
+                    flash_fp16_mma<true><<<grid, WARPS * 32>>>(dQ, dK, dV, dO, N);
+                else
+                    flash_fp16_mma<false><<<grid, WARPS * 32>>>(dQ, dK, dV, dO, N);
+            };
 
-        cudaMemcpy(hO, dO, hB, cudaMemcpyDeviceToHost);
-        float maxe = 0.0f, maxc = 1e-6f;
-        // 大尺寸全量 CPU 对拍过慢，行数 > 256 时只抽样对拍前 64 行
-        const int check_rows = (N <= 256) ? N : 64;
-        for (int i = 0; i < check_rows * D; ++i) {
-            float o = __half2float(hO[i]);
-            maxe = fmaxf(maxe, fabsf(o - hRef[i]));
-            maxc = fmaxf(maxc, fabsf(hRef[i]));
+            launch();
+            cudaDeviceSynchronize();
+            cudaError_t err = cudaGetLastError();
+            if (err != cudaSuccess) {
+                printf("N=%4d mode=%s CUDA error: %s\n", N,
+                       causal ? "causal" : "full", cudaGetErrorString(err));
+                return 1;
+            }
+
+            // 计时（预热 + 多轮平均，与仓库其他 benchmark 同口径）
+            cudaEvent_t s, e;
+            cudaEventCreate(&s); cudaEventCreate(&e);
+            for (int i = 0; i < 5; ++i) launch();
+            cudaDeviceSynchronize();
+            cudaEventRecord(s);
+            for (int i = 0; i < 50; ++i) launch();
+            cudaEventRecord(e); cudaEventSynchronize(e);
+            float ms = 0; cudaEventElapsedTime(&ms, s, e); ms /= 50;
+            cudaEventDestroy(s); cudaEventDestroy(e);
+
+            cudaMemcpy(hO, dO, hB, cudaMemcpyDeviceToHost);
+            float maxe = 0.0f, maxc = 1e-6f;
+            // 大尺寸全量 CPU 对拍过慢，行数 > 256 时只抽样对拍前 64 行
+            const int check_rows = (N <= 256) ? N : 64;
+            for (int i = 0; i < check_rows * D; ++i) {
+                float o = __half2float(hO[i]);
+                maxe = fmaxf(maxe, fabsf(o - hRef[i]));
+                maxc = fmaxf(maxc, fabsf(hRef[i]));
+            }
+            printf("v4 fp16-mma N=%4d mode=%-7s | %s maxErr=%.4f relErr=%.2e | %.3f ms\n",
+                   N, causal ? "causal" : "full",
+                   (maxe / maxc < 1e-2 ? "PASS!" : "FAIL!"),
+                   maxe, maxe / maxc, ms);
         }
-        printf("v4 fp16-mma N=%4d | %s maxErr=%.4f relErr=%.2e | %.3f ms\n",
-               N, (maxe / maxc < 1e-2 ? "PASS!" : "FAIL!"), maxe, maxe / maxc, ms);
 
         cudaFree(dQ); cudaFree(dK); cudaFree(dV); cudaFree(dO);
         free(hQf); free(hKf); free(hVf); free(hQ); free(hK); free(hV); free(hO); free(hRef);
     }
     return 0;
 }
+#endif

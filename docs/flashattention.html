@@ -31,7 +31,9 @@
   <div class="formula">S  = Q · Kᵀ / √D        (N×N 的分数矩阵，O(N²D) 次运算，O(N²) 内存)
 P  = softmax(S)          (按行归一化)
 O  = P · V               (N×D 输出)</div>
-  <p><strong>朴素实现的瓶颈</strong>：S 矩阵大小是 N×N，对长序列（N=8192）是 8192²×4B ≈ 256MB。<strong>必须把 S 写回全局内存（HBM）再读回来</strong>做 softmax 和 ×V——这一写一读完全受 HBM 带宽限制，是 memory-bound 的灾难。</p>
+  <div class="definition"><b>每个下标代表什么：</b>Q 的第 <code>i</code> 行是第 i 个 token 发出的 query，K/V 的第 <code>j</code> 行是第 j 个 token 的 key/value。<code>S[i][j]</code> 衡量 token i 是否应该关注 token j；softmax 沿 j（同一 query 对所有 key）做，因此 <code>P[i]</code> 是一组和为 1 的注意力权重，最后用它对 V 加权求和。</div>
+  <div class="key-answer"><b>FlashAttention 的目标不是少算数学结果：</b>它仍然计算同一个 <code>O = softmax(QKᵀ/√D)V</code>，只是把 N×N 的中间矩阵拆成小块，在片上完成“打分 → softmax → 加权求和”，让中间结果不必写回 HBM。</div>
+  <p><strong>朴素实现的瓶颈</strong>：S 矩阵大小是 N×N，对长序列（N=8192）是 8192²×4B ≈ 256MB；P 通常还要再占一份同规模空间。<strong>必须把 S 写回全局内存（HBM）再读回来</strong>做 softmax 和 ×V——这一写一读完全受 HBM 带宽限制，也让显存占用按 N² 增长。</p>
 
   <p><strong>数据怎么流动</strong>（下面这张 N×N 的 S 就是"元凶"）：</p>
   <div class="move-row" style="gap:14px">
@@ -75,6 +77,7 @@ alpha = exp(m_old - m_new)              // 旧最大变小 → 旧统计要按�
 l_new = alpha·l_old + Σ_c exp(S[c]-m_new)
 acc   = alpha·acc + Σ_c exp(S[c]-m_new)·V[c]</div>
   <p>直觉：旧的最大值若被新块超过，旧块的 exp(S-m_old) 全部偏大，<strong>乘 alpha 统一缩回去</strong>，再叠上新块的贡献。最终 <code>O = acc / l</code>。这就是"不必回头、单遍扫过 KV"的全部依据。</p>
+  <div class="definition"><b>为什么这样仍等价于普通 softmax：</b>处理到任意一个 KV 块后，都保持不变量 <code>l = Σ exp(S-m)</code>、<code>acc = Σ exp(S-m)V</code>，其中求和只覆盖已经扫描的列。若新块抬高了 m，旧项统一乘 <code>exp(m_old-m_new)</code>，不变量仍成立；扫完最后一块时，<code>acc/l</code> 正好就是完整 softmax 的加权平均。</div>
 
   <div class="flow">
     <span class="node">Q 行(驻寄存器)</span><span class="arrow">→</span>
@@ -83,6 +86,16 @@ acc   = alpha·acc + Σ_c exp(S[c]-m_new)·V[c]</div>
     <span class="node">累加 O(=acc/l)</span><span class="arrow">→</span>
     <span class="node">写回</span>
   </div>
+
+  <h3>把一个 Q block 的执行顺序展开</h3>
+  <div class="steps">
+    <div class="step"><b>保留 Q：</b>将一小块 Q 行放入寄存器或 shared memory；这些行会反复与不同的 K/V 块计算。</div>
+    <div class="step"><b>加载 K/V：</b>协作把当前 <code>Bc</code> 行 K、V 搬进 shared memory，所有线程等待搬运完成。</div>
+    <div class="step"><b>计算分数块：</b>对当前 <code>Br×Bc</code> 的分数做缩放；causal 模式下，未来位置设为负无穷，相应概率为 0。</div>
+    <div class="step"><b>在线更新：</b>用新块的 max、<code>alpha</code>、sum 更新 <code>m/l/acc</code>，随后立即丢弃当前 S 块。</div>
+    <div class="step"><b>最终写回：</b>所有 KV 块扫完后才做 <code>O = acc/l</code>，每个输出元素只写回一次。</div>
+  </div>
+  <p class="definition"><b>空间复杂度的直觉：</b>朴素 attention 需要保存整个 N×N 的 S/P；分块实现只保留 <code>Br×Bc</code> 的分数块、<code>Bc×D</code> 的 K/V tile 和 <code>Br×D</code> 的累加状态，临时空间随 tile 大小增长，而不是随序列长度平方增长。</p>
 
   <p><strong>分块扫描长什么样</strong>——下面这个 seeker 就是逐块搬进来的 K/V 块，它从左往右扫过一整行 Q；每扫一块，就更新一次 O（那个小方块）：</p>
   <div class="slide">
@@ -186,7 +199,7 @@ __shared__ float Vtile[Bc][D+1];
       <li><strong>行归约全在 warp 内</strong>：每 warp 扫全部 K/V 块，softmax 的 max/sum 归约不跨 warp 通信，直接继承 v3 的在线软 max。</li>
       <li><strong>fragment 布局复用 gemm_v4 的已验证版</strong>：<code>load_A_verified</code> 直接搬 gemm_v4 的 A fragment 布局（a0~a3），踩过的坑不再重踩。</li>
     </ul>
-    <p><strong>当前边界</strong>：Stage 1 只做 full attention（非 causal），Bq=Bc=D=64 固定，N 需被 64 整除——纯最小实现，先验证 mma 通路与布局正确，与 GEMM v4 定位一致。</p>
+    <p><strong>当前边界</strong>：Bq=Bc=D=64 固定；full/causal 两种模式都通过模板特化，K/V 尾块与 causal 未来位置均使用 score mask，N 可以不是 64 的倍数。</p>
   </div>
 
   <h2>四、四版区别总览</h2>
@@ -195,7 +208,7 @@ __shared__ float Vtile[Bc][D+1];
     <tr><td>v1</td><td>一线程一行</td><td>fp32</td><td>否</td><td>分块 + online softmax（S 不落 HBM）</td></tr>
     <tr><td>v2</td><td>一线程一行</td><td>fp32</td><td>✔ 模板双模式</td><td>causal 块级截断 + 逐元素 mask</td></tr>
     <tr><td>v3</td><td>一 warp 一行</td><td>fp32</td><td>✔</td><td>warp-per-row 寄存器瘦身 + padding 消 bank conflict</td></tr>
-    <tr><td>v4</td><td>一 warp 16 行</td><td>fp16 / fp32 累加</td><td>否（Stage 1）</td><td>手写 mma.sync 做 QKᵀ 与 PV</td></tr>
+    <tr><td>v4</td><td>一 warp 16 行</td><td>fp16 / fp32 累加</td><td>✔ 模板双模式</td><td>手写 mma.sync + K/V tail mask + causal mask</td></tr>
   </table>
 
   <div class="note"><b>一句话主线</b>：v1 奠定"分块 + online softmax"的正确性骨架；v2 补 causal 并踩出 occupancy 的教训；v3 用 warp-per-row 把 occupancy 从 2% 拉回 79%；v4 最终把两个 GEMM 换成 Tensor Core——四步走完，手工实现正式向 FA2 对齐。</div>

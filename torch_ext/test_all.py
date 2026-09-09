@@ -1,4 +1,4 @@
-# 全量测试：5 个算子的正确性对拍 + 性能 benchmark（交错计时，同会话）
+# 全量测试：6 个测试项的正确性对拍 + 性能 benchmark（交错计时，同会话）
 import time
 import torch
 import ai_infra_ops
@@ -88,3 +88,26 @@ check("FlashAttention causal", out_causal, torch_attn(True), 1e-2)
 t_mine_f = bench(lambda: ai_infra_ops.flashattention(q, k, v, False), iters=20)
 t_mine_c = bench(lambda: ai_infra_ops.flashattention(q, k, v, True), iters=20)
 print(f"  custom full {t_mine_f:.4f} ms | causal {t_mine_c:.4f} ms | causal speedup {t_mine_f/t_mine_c:.2f}x")
+
+# ---------------- FlashAttention v4（fp16 Tensor Core，含尾块 + causal） ----------------
+# N=129 专门覆盖不是 64 倍数的 K/V 尾块；v4 的 Q/K/V 与输出均为 fp16。
+N3 = 129
+q16 = torch.randn(N3, 64, device=device, dtype=torch.float16)
+k16 = torch.randn(N3, 64, device=device, dtype=torch.float16)
+v16 = torch.randn(N3, 64, device=device, dtype=torch.float16)
+
+def torch_attn_fp16(causal):
+    # 用 fp16 量化后的输入做 fp32 reference，最后转回 fp16 对齐 v4 输出语义。
+    s = (q16.float() @ k16.float().T) * (64 ** -0.5)
+    if causal:
+        future = torch.triu(torch.ones(N3, N3, device=device, dtype=torch.bool), diagonal=1)
+        s = s.masked_fill(future, float("-inf"))
+    return (torch.softmax(s, dim=-1) @ v16.float()).half()
+
+out = ai_infra_ops.flashattention_fp16(q16, k16, v16, False)
+check("FlashAttention v4 full", out.float(), torch_attn_fp16(False).float(), 2e-2)
+out = ai_infra_ops.flashattention_fp16(q16, k16, v16, True)
+check("FlashAttention v4 causal", out.float(), torch_attn_fp16(True).float(), 2e-2)
+t_v4_f = bench(lambda: ai_infra_ops.flashattention_fp16(q16, k16, v16, False), iters=50)
+t_v4_c = bench(lambda: ai_infra_ops.flashattention_fp16(q16, k16, v16, True), iters=50)
+print(f"  v4 full {t_v4_f:.4f} ms | causal {t_v4_c:.4f} ms | causal speedup {t_v4_f/t_v4_c:.2f}x")

@@ -8,3 +8,4 @@ torch::Tensor layernorm_forward(torch::Tensor x, double eps);
 torch::Tensor gemm_forward(torch::Tensor a, torch::Tensor b);
 torch::Tensor gemm_mma_forward(torch::Tensor a, torch::Tensor b);
 torch::Tensor flashattention_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, bool causal);
+torch::Tensor flashattention_fp16_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v, bool causal);

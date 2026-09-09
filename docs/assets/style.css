@@ -87,6 +87,48 @@ em { color: var(--accent-2); font-style: normal; }
 .card p { margin: 6px 0; font-size: 13.5px; color: var(--text-dim); }
 .card .more { display: inline-block; margin-top: 8px; font-size: 13.5px; font-weight: 600; }
 
+/* ---- 阅读引导 / 概念提示 ---- */
+.reading-guide {
+  background: linear-gradient(135deg, rgba(79,156,249,.10), rgba(52,211,153,.05));
+  border: 1px solid var(--border); border-radius: 12px;
+  padding: 18px 20px; margin: 24px 0 30px;
+}
+.reading-guide h2 { margin: 0 0 12px; padding: 0; border: 0; font-size: 18px; }
+.guide-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+.guide-item {
+  background: rgba(15,18,22,.38); border: 1px solid var(--border);
+  border-radius: 8px; padding: 12px 14px;
+}
+.guide-item b { display: block; color: #fff; margin-bottom: 3px; }
+.guide-item span { color: var(--text-dim); font-size: 13px; }
+.key-answer {
+  border-left: 3px solid var(--accent-2);
+  background: rgba(52,211,153,.07); border-radius: 8px;
+  padding: 11px 15px; margin: 16px 0;
+}
+.key-answer b { color: var(--accent-2); }
+.definition {
+  border: 1px dashed var(--border); border-radius: 8px;
+  padding: 10px 14px; margin: 14px 0; color: var(--text-dim);
+  font-size: 13.5px;
+}
+.definition b { color: var(--text); }
+.steps { counter-reset: doc-step; margin: 16px 0; }
+.steps .step {
+  position: relative; padding: 0 0 12px 34px; color: var(--text-dim);
+}
+.steps .step::before {
+  counter-increment: doc-step; content: counter(doc-step);
+  position: absolute; left: 0; top: 1px; width: 22px; height: 22px;
+  border-radius: 50%; display: grid; place-items: center;
+  background: var(--accent); color: #0b0e13; font-weight: 700; font-size: 12px;
+}
+.steps .step:not(:last-child)::after {
+  content: ""; position: absolute; left: 10px; top: 24px; bottom: 0;
+  border-left: 1px dashed var(--border);
+}
+.steps .step b { color: #fff; }
+
 /* ---- 算子版本卡片 ---- */
 .op {
   background: var(--card-2); border: 1px solid var(--border);
@@ -186,10 +228,11 @@ td.bad { color: var(--warn); }
   border-collapse: separate;
 }
 /* 关键修复：HTML 用 <table><tr><td>，但 .mx 是 grid。
-   <tr> 若保留保留 table-row display，会被当成单个 grid 项，
-   把整行 <td> 挤进首列 → 只显示第一列。
-   用 display:contents 让 <tr> 不生成盒子，<td> 直接成为 grid 项，
+   浏览器会自动在 <tr> 外插入 <tbody>；如果 tbody/tr 仍保留表格布局，
+   它们会阻断 grid，让单元格布局异常、看起来只显示第一列。
+   移除这两个中间盒子后，<td> 才能直接成为 grid 项，
    按 grid-template-columns 正确排布成多列。 */
+.mx tbody { display: contents; }
 .mx tr { display: contents; }
 /* grid 不认 HTML 的 colspan，用属性选择器把跨度映射成 grid-column */
 .mx td[colspan="2"] { grid-column: span 2; }
@@ -287,4 +330,5 @@ td.bad { color: var(--warn); }
 @media (max-width: 640px) {
   .wrap { padding: 24px 16px 60px; }
   .topbar { padding: 10px 16px; gap: 10px; }
+  .guide-grid { grid-template-columns: 1fr; }
 }

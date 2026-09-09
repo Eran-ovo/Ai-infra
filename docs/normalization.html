@@ -26,6 +26,9 @@
     <p class="sub">三个算子的共同骨架：一行一个 block，块内树形归约求统计量，最终一次写回。区别只在"归约几次、要不要减均值"。</p>
   </div>
 
+  <div class="definition"><b>先明确“行”：</b>本文把输入看成 <code>[B, N]</code>，每个 batch 的一行长度为 N；归一化沿最后一维 N 进行，不会把不同 batch 的行混在一起。于是 <code>grid = B</code>，第 <code>blockIdx.x</code> 个 block 只负责第 <code>blockIdx.x</code> 行。</div>
+  <div class="key-answer"><b>归约和归一化不是一回事：</b>归约负责把一行压缩成统计量（例如 max、sum、mean）；归一化负责拿这个统计量重新访问该行并生成输出。GPU 优化的关键，是让这两步在同一个 block 内完成，减少中间结果落到显存。</div>
+
   <h2>一、它们为什么是一类：同一个"行归约"骨架</h2>
   <p>Softmax、LayerNorm、RMSNorm 都有一个共同特征：<strong>对矩阵的每一行做一个统计量（max / 和 / 平方和），再用这个统计量归一化该行</strong>。
   问题本质是 <strong>row-wise reduction</strong>——把长度 N 的一行数据"压成一个标量"。这决定了它们的 CUDA 实现共享同一套模板：</p>
@@ -44,6 +47,16 @@
     <span class="node">warp shuffle (32→1)</span><span class="arrow">→</span>
     <span class="node">广播 + 归一化写回</span>
   </div>
+
+  <h3>把一行数据带着算一遍</h3>
+  <p>假设一行是 <code>x = [1, 2, 3]</code>。三种算子都看同一行，但“统计什么、输出想表达什么”不同：</p>
+  <table>
+    <tr><th>算子</th><th>先得到的统计量</th><th>输出含义</th></tr>
+    <tr><td>Softmax</td><td><code>max=3</code>，再求 <code>Σexp(x-3)</code></td><td>三个位置的非负权重，总和为 1，较大的输入权重更大</td></tr>
+    <tr><td>LayerNorm</td><td><code>mean=2</code>，再求方差</td><td>减均值、除标准差；这一行输出约为 <code>[-1.225, 0, 1.225]</code></td></tr>
+    <tr><td>RMSNorm</td><td><code>mean(x²)=14/3</code></td><td>只按这一行的 RMS 缩放，不把均值移到 0</td></tr>
+  </table>
+  <p>这个例子也解释了为什么三者不能只看名字：Softmax 的“减 max”只是为了防止指数溢出，不是 LayerNorm 意义上的 centering（减均值）。</p>
 
   <p><strong>归约树长什么样</strong>——以一行 8 个元素为例，先求它们的 <code>max</code>（Softmax 第一步用的就是它）：每轮两两取大，层数减半，从 8 个值减到 1 个标量。</p>
   <div class="tree">
@@ -88,6 +101,15 @@
   <p>降到 32 之后，剩下的线程恰好在一个 warp 内。warp 是 SIMD 一起执行的，<code>__shfl_down_sync</code> 直接从"比我低 s 位的 lane"那把值读进寄存器——<strong>不需要中间写共享内存，也不需要 <code>__syncthreads</code></strong>。这就是"树形归约做到 32 为止，最后一步换 shuffle"的全部理由。</p>
   <div class="note"><b>一个易错点</b>：shuffle 的步长从 16 开始（不是 32）。因为 32 已是 warp 宽度，<code>shfl_down(32)</code> 会越界返回自身，导致值被翻倍。</div>
 
+  <h3>一个 block 的完整时间线</h3>
+  <div class="steps">
+    <div class="step"><b>分配行：</b>block 通过 <code>row = blockIdx.x</code> 找到本行起始地址；线程 <code>tid</code> 处理 <code>tid, tid+BLOCK, ...</code> 这些位置。</div>
+    <div class="step"><b>局部计算：</b>每个线程在寄存器里先算自己的局部 max、sum 或 sum-of-squares，再把一个局部值放进 shared memory。</div>
+    <div class="step"><b>合并局部值：</b>shared memory 完成 256→32，最后一个 warp 用 shuffle 得到整行唯一统计量；中间的同步保证生产者和消费者顺序正确。</div>
+    <div class="step"><b>生成输出：</b>统计量广播给所有线程，各线程再次按 grid-stride 遍历本行，计算最终值并写回对应位置。</div>
+  </div>
+  <p class="definition"><b>为什么 block 之间不用通信？</b> 每个 block 只处理一行，行与行之间没有依赖；这让整个 batch 可以同时启动多个 block。代价是单行很短时线程利用率可能不高，实际库通常还会针对不同 N 选择不同 kernel。</p>
+
   <h2>三、逐算子原理与区别</h2>
 
   <div class="op">
@@ -97,7 +119,7 @@
       <span class="op-perf">0.031 ms · maxErr 1.7e-08</span>
     </div>
     <div class="formula">softmax(x)_i = exp(x_i - max) / Σ_j exp(x_j - max)</div>
-    <p><strong>为什么减 max</strong>：直接算 <code>exp(x_i)</code> 会在 x_i 稍大时上溢（exp(90) 已超 fp32 范围）。减掉行最大值后指数 ≤ 0，值域稳定在 (0,1]，这是数值安全版的标准写法学。</p>
+    <p><strong>为什么减 max</strong>：直接算 <code>exp(x_i)</code> 会在 x_i 稍大时上溢（<code>exp(90)</code> 已超 fp32 范围）。减掉行最大值后指数 ≤ 0，值域稳定在 (0,1]，这是数值安全版的标准写法。</p>
     <p><strong>为什么是两次归约</strong>：softmax 需要两个统计量——先扫一遍求 <code>max</code>（第一次归约），再扫一遍求 <code>Σ exp(x-max)</code>（第二次归约），最后第三次写回归一化值。两次归约之间有<strong>数据依赖</strong>（求和需要先知道 max），所以是串行的两轮。</p>
     <p><strong>特点</strong>：纯逐元素，不引入额外可学习参数。fused 到单个 kernel，中间结果（exp 值）不再写回全局内存。</p>
     <p><strong>在一行上收什么</strong>（下半部分那条向量就是一整行数据）：</p>

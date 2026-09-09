@@ -13,4 +13,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("gemm_mma",       &gemm_mma_forward,       "GEMM forward (CUDA, fp16 Tensor Core mma.sync)");
     m.def("flashattention", &flashattention_forward, "FlashAttention forward (CUDA, online softmax)",
           py::arg("q"), py::arg("k"), py::arg("v"), py::arg("causal") = false);
+    m.def("flashattention_fp16", &flashattention_fp16_forward,
+          "FlashAttention v4 forward (CUDA, fp16 Tensor Core mma.sync)",
+          py::arg("q"), py::arg("k"), py::arg("v"), py::arg("causal") = false);
 }

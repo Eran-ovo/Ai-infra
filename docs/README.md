@@ -23,7 +23,7 @@ docs/
 | GEMM | tiling 复用 + 访存优化 + 换硬件 | gemm_v0/v1/v2/v3_cutlass/v4_mma |
 | 归约/归一化 | 块内树形归约 + warp shuffle，fusion 一次写回 | softmax / layernorm / rmsnorm |
 | FlashAttention | 分块 + online softmax（S 不落 HBM） | flashattention_v1/v2/v3/v4 |
-| PyTorch 封装 | 手写 kernel → torch 算子（包装层 + 绑定 + 校验） | torch_ext/csrc/*（6 个 forward） |
+| PyTorch 封装 | 手写 kernel → torch 算子（包装层 + 绑定 + 校验） | torch_ext/csrc/*（7 个 forward） |
 
 ## 如何扩展
 

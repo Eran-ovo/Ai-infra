@@ -26,8 +26,18 @@
     <p class="sub">RTX 3060 Laptop (sm_86) · CUDA 12.4 · WSL2 —— 每个算子的「为什么这样做」与版本间「差在哪」</p>
   </div>
 
-  <p>仓库 <code>kernels/</code> 下目前 11 个算子，按<strong>底层数据结构与优化主线</strong>归成三类。
-  同一类共享一段核心原理，版本迭代则是对这条主线上某个瓶颈的逐步填补。</p>
+  <div class="reading-guide">
+    <h2>建议的阅读方式</h2>
+    <p>不要把这些页面当成 CUDA API 速查表。每一页都沿着同一条线索展开：先看数学问题，再看数据如何分块，最后看线程为什么这样分工。</p>
+    <div class="guide-grid">
+      <div class="guide-item"><b>刚接触 GPU 优化</b><span>先看本页共同地基，再读 GEMM 的 v0→v4，建立“搬数据 / 复用 / 换硬件”的直觉。</span></div>
+      <div class="guide-item"><b>想理解 Transformer</b><span>按 GEMM → 归一化 → FlashAttention 阅读，重点观察矩阵乘、行归约和注意力之间的关系。</span></div>
+      <div class="guide-item"><b>想运行代码</b><span>先读各页的“当前边界”，最后看 PyTorch 封装页；那里列出了 dtype、shape 和 contiguous 要求。</span></div>
+    </div>
+  </div>
+
+  <p>仓库 <code>kernels/</code> 下目前 11 个 CUDA 实现，按<strong>底层数据结构与优化主线</strong>归成三类。
+  同一类共享一段核心原理，版本迭代则是对这条主线上某个瓶颈的逐步填补。这里的“快”不是抽象结论，而是针对文中给出的输入规模和 RTX 3060 Laptop 测得的结果。</p>
 
   <div class="grid">
 
@@ -64,6 +74,8 @@
     </div>
 
   </div>
+
+  <div class="key-answer"><b>先记住一个判断框架：</b>看到一个慢 kernel，先问“它在算什么、数据被重复读了几次、一个 block 内谁负责哪部分、瓶颈是带宽还是计算”。下面三页分别用 GEMM、归约和 attention 把这四个问题走一遍。</div>
 
   <h2>三类算子的共同地基</h2>
   <p>虽然表面各异，三类算子反复用到同一批 CUDA 基本功，读任意一类前先看懂这几件：</p>
