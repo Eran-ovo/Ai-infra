@@ -1,5 +1,5 @@
 // PyTorch 包装：复用 kernels/flashattention_v4.cu 中已经验证过的 Tensor Core kernel。
-// v3 保留在 flashattention_cuda.cu，作为 fp32 baseline；本文件新增 fp16 v4 API。
+// v3 attention_cuda.cu，作为 fp32 baseline；本文件新增 fp16 v4 API。
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
