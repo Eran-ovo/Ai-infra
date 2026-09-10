@@ -23,7 +23,7 @@
 
   <div class="hero">
     <h1>FlashAttention：分块 + Online Softmax</h1>
-    <p class="sub">四个版本复现 FA2：v1 分块 + online softmax → v2 causal → v3 warp-per-row → v4 fp16 Tensor Core。核心主张始终是「让 S 矩阵永不落地 HBM」。</p>
+    <p class="sub">五个版本复现 FA2：v1 分块 + online softmax → v2 causal → v3 warp-per-row → v4 fp16 Tensor Core → v5 P fragment 寄存器直连。核心主张始终是「让 S 矩阵永不落地 HBM」。</p>
   </div>
 
   <h2>一、先看标准 attention 哪里"贵"</h2>
@@ -190,7 +190,7 @@ __shared__ float Vtile[Bc][D+1];
     <div class="op-head">
       <span class="op-title">v4 · fp16 + 手写 Tensor Core（复现 FA2 的关键一步）</span>
       <span class="op-file">kernels/flashattention_v4.cu</span>
-      <span class="op-perf">N=4096 1.53 ms（full attention）</span>
+      <span class="op-perf">N=8192 full 4.2508 ms</span>
     </div>
     <p><strong>解决什么</strong>：v3 是 fp32，QKᵀ 和 PV 两个矩阵乘仍是 FMA 逐点算。与 GEMM v4 同理——真正复现 FA2 性能要把这两个 GEMM 换成 Tensor Core。</p>
     <p><strong>改法</strong>：Q/K/V 用 fp16，累加和 softmax 用 fp32。<code>S = Q@Kᵀ</code> 和 <code>O += P@V</code> 都用 <code>mma.sync.m16n8k16</code>。</p>
@@ -198,20 +198,38 @@ __shared__ float Vtile[Bc][D+1];
       <li><strong>warp 划分对齐 FA2</strong>：每 block 处理 Bq=64 行 Q，4 个 warp，每 warp 独占 16 行（正好一个 mma 的 M-tile）。</li>
       <li><strong>行归约全在 warp 内</strong>：每 warp 扫全部 K/V 块，softmax 的 max/sum 归约不跨 warp 通信，直接继承 v3 的在线软 max。</li>
       <li><strong>fragment 布局复用 gemm_v4 的已验证版</strong>：<code>load_A_verified</code> 直接搬 gemm_v4 的 A fragment 布局（a0~a3），踩过的坑不再重踩。</li>
+      <li><strong>清晰的 P 数据通路</strong>：softmax 后先把 P 写入 padded <code>Ps[64][65]</code>，PV 前再按 A fragment 布局加载；多一次 smem 中转，但便于验证正确性。</li>
     </ul>
     <p><strong>当前边界</strong>：Bq=Bc=D=64 固定；full/causal 两种模式都通过模板特化，K/V 尾块与 causal 未来位置均使用 score mask，N 可以不是 64 的倍数。</p>
   </div>
 
-  <h2>四、四版区别总览</h2>
+  <div class="op v-highlight">
+    <div class="op-head">
+      <span class="op-title">v5 · P fragment 寄存器直连</span>
+      <span class="op-file">kernels/flashattention_v5.cu</span>
+      <span class="op-perf">N=8192 full 3.3810 ms · v4/v5=1.26x</span>
+    </div>
+    <p><strong>观察</strong>：QK 的每个 <code>m16n8</code> 输出 fragment 已经按行分散在 <code>S[t][0..3]</code> 中；相邻两个 8 列 fragment 正好能拼成 PV 所需的 row-major <code>m16k16</code> A fragment。无需把 P 写入 <code>Ps</code> 再读回来。</p>
+    <pre>pa0 = half2(S[st][0],     S[st][1]);      // row g,   cols 0..7
+pa1 = half2(S[st][2],     S[st][3]);      // row g+8, cols 0..7
+pa2 = half2(S[st + 1][0], S[st + 1][1]);  // row g,   cols 8..15
+pa3 = half2(S[st + 1][2], S[st + 1][3]);  // row g+8, cols 8..15</pre>
+    <p><strong>证据链</strong>：v4/v5 在 N=129 full/causal 的误差逐项相同；static smem 33.28→24.96 KB（恰好减少 <code>64×65×2=8,320 B</code>）；理论 occupancy 16.67%→25%，实测 15.55%→21.28%；N=8192 full/causal 提速 1.26x/1.17x。</p>
+    <p><strong>批量多头</strong>：同一 kernel 进一步用 <code>grid.x</code> 枚举 Q block、<code>grid.y</code> 枚举展平的 batch×head，同时支持 <code>[N,64]</code> 与连续 <code>[B,H,N,64]</code>。B=2/H=8/N=1024 时，相比 Python 逐 head dispatch，full/causal 分别减少到 1/3.11 和 1/5.13 的耗时。</p>
+    <div class="tip"><b>关键认识</b>：fragment 不是只能“从 shared memory 加载”的黑盒。只要证明生产者的 C-fragment 布局与消费者的 A-fragment 布局之间的映射，就可以直接在寄存器中重排，消除中间存储。</div>
+  </div>
+
+  <h2>四、五版区别总览</h2>
   <table>
     <tr><th>版本</th><th>线程映射</th><th>精度</th><th>causal</th><th>核心增量</th></tr>
     <tr><td>v1</td><td>一线程一行</td><td>fp32</td><td>否</td><td>分块 + online softmax（S 不落 HBM）</td></tr>
     <tr><td>v2</td><td>一线程一行</td><td>fp32</td><td>✔ 模板双模式</td><td>causal 块级截断 + 逐元素 mask</td></tr>
     <tr><td>v3</td><td>一 warp 一行</td><td>fp32</td><td>✔</td><td>warp-per-row 寄存器瘦身 + padding 消 bank conflict</td></tr>
     <tr><td>v4</td><td>一 warp 16 行</td><td>fp16 / fp32 累加</td><td>✔ 模板双模式</td><td>手写 mma.sync + K/V tail mask + causal mask</td></tr>
+    <tr><td>v5</td><td>一 warp 16 行</td><td>fp16 / fp32 累加</td><td>✔ 模板双模式</td><td>QK 的 C fragment 直连 PV 的 A fragment，删除 Ps</td></tr>
   </table>
 
-  <div class="note"><b>一句话主线</b>：v1 奠定"分块 + online softmax"的正确性骨架；v2 补 causal 并踩出 occupancy 的教训；v3 用 warp-per-row 把 occupancy 从 2% 拉回 79%；v4 最终把两个 GEMM 换成 Tensor Core——四步走完，手工实现正式向 FA2 对齐。</div>
+  <div class="note"><b>一句话主线</b>：v1 奠定"分块 + online softmax"的正确性骨架；v2 补 causal 并踩出 occupancy 的教训；v3 用 warp-per-row 重划分工作；v4 把两个 GEMM 换成 Tensor Core并以 Ps 建立清晰基线；v5 再利用 fragment 布局删除 Ps 中转——形成一次完整、可归因的性能优化实验。</div>
 
   <div class="footer">
     <span>cuda-kernels · FlashAttention 类</span>

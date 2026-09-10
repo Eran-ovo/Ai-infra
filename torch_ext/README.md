@@ -1,6 +1,6 @@
 # torch_ext：把手写 CUDA kernel 封装成 PyTorch 算子
 
-把 `kernels/` 下 5 类手写 CUDA kernel（GEMM / Softmax / LayerNorm / RMSNorm / FlashAttention）统一封装成一个 PyTorch Extension 模块 `ai_infra_ops`，当前暴露 7 个 Python 入口。
+把 `kernels/` 下 5 类手写 CUDA kernel（GEMM / Softmax / LayerNorm / RMSNorm / FlashAttention）统一封装成一个 PyTorch Extension 模块 `ai_infra_ops`，当前暴露 8 个 Python 入口。
 
 ## 环境
 
@@ -15,7 +15,7 @@ python3 -m venv ~/venvs/torch
 
 ```bash
 cd torch_ext
-export PATH=/usr/local/cuda/bin:$PATH
+export PATH=~/venvs/torch/bin:/usr/local/cuda/bin:$PATH
 export TORCH_CUDA_ARCH_LIST="8.6"   # RTX 3060 Laptop = Ampere sm_86
 ~/venvs/torch/bin/python setup.py build_ext --inplace
 ~/venvs/torch/bin/python test_all.py
@@ -33,7 +33,8 @@ ai_infra_ops.layernorm(x, eps)           # x [B,N] fp32，无 affine
 ai_infra_ops.gemm(a, b)                  # a [M,K] b [K,N] fp32 -> [M,N]
 ai_infra_ops.gemm_mma(a, b)              # a [M,K] b [K,N] fp16 -> [M,N] fp32（手写 Tensor Core）
 ai_infra_ops.flashattention(q, k, v, causal)  # q/k/v [N,64] fp32
-ai_infra_ops.flashattention_fp16(q, k, v, causal)  # q/k/v [N,64] fp16，v4 Tensor Core
+ai_infra_ops.flashattention_fp16(q, k, v, causal)  # v4：fp16 Tensor Core，P 经 Ps 中转
+ai_infra_ops.flashattention_v5(q, k, v, causal)    # v5：[N,64] 或 [B,H,N,64]，P fragment 寄存器直连
 ```
 
 ## 实测结果（RTX 3060 Laptop，同会话交错计时，test_all.py 复现）
@@ -48,7 +49,8 @@ ai_infra_ops.flashattention_fp16(q, k, v, causal)  # q/k/v [N,64] fp16，v4 Tens
 | GEMM mma fp16 (2048^3) | 3.889 ms | 0.867 ms (cuBLAS fp16) | 0.22x |
 | GEMM mma fp16 (4096^3) | 26.532 ms | 6.542 ms (cuBLAS fp16) | 0.25x |
 | FlashAttention v3 (N=8192 D=64) | full 16.7522 / causal 8.8380 ms | - | causal 提速 1.90x |
-| FlashAttention v4 (N=129 D=64, fp16) | full 0.0253 / causal 0.0238 ms | - | causal 提速 1.06x |
+| FlashAttention v4 (N=129 D=64, fp16) | full 0.0267 / causal 0.0611 ms | - | 短序列固定开销主导 |
+| FlashAttention v5 (N=129 D=64, fp16) | full 0.0221 / causal 0.0198 ms | - | P fragment 寄存器直连 |
 
 ### 2026-09-10 实机验证记录
 
@@ -74,30 +76,58 @@ export TORCH_CUDA_ARCH_LIST="8.6"
 [FlashAttention causal] PASS  maxErr=3.576e-07
 [FlashAttention v4 full] PASS  maxErr=4.883e-04
 [FlashAttention v4 causal] PASS  maxErr=9.766e-04
+[FlashAttention v5 full] PASS  maxErr=4.883e-04
+[FlashAttention v5 causal] PASS  maxErr=9.766e-04
 ```
 
-v4 测试使用 `N=129`，专门覆盖不是 64 倍数的 K/V 尾块，同时验证 full 和 causal 两种模式。v4 输出为 fp16，reference 使用 fp16 输入、fp32 计算后再转回 fp16，误差阈值为 `2e-2`。
+v4/v5 测试使用 `N=129`，专门覆盖不是 64 倍数的 K/V 尾块，同时验证 full 和 causal 两种模式。两版输出为 fp16，reference 使用 fp16 输入、fp32 计算后再转回 fp16，误差阈值为 `2e-2`。v4/v5 的误差逐项完全相同，说明 v5 只改变 P 的搬运路径，没有改变数值语义。
 
-### 长序列性能：v3 vs v4
+额外边界回归覆盖 `N={1,7,63,64,65,127,128,129,257}` 的 full/causal，结果为 `PASS maxErr=9.766e-04, v4-v5=0`。这些尺寸覆盖 64×64 tile 的边界前、边界上、边界后以及多个 KV tile。
 
-使用 [bench_flashattention.py](bench_flashattention.py) 进行 CUDA Event 计时。v3 使用 fp32，v4 使用 fp16 Tensor Core；因此这是“数据类型 + Tensor Core + kernel 组织”的端到端对比，不是只改变一个变量的微基准。
+批量多头回归使用 `[B,H,N,D]=[2,3,65,64]`，full/causal 对拍 `torch.nn.functional.scaled_dot_product_attention`，最大误差分别为 `2.441e-04` 和 `1.221e-04`。`N=65` 同时验证每个 head 的地址隔离和 K/V tail。
+
+### 批量多头：二维 CUDA grid
+
+v5 同时接受 `[N,64]` 和连续的 `[B,H,N,64]`。kernel 使用 `grid.x` 枚举 64 行 Q block，使用 `grid.y` 枚举展平后的 `batch×head`：
+
+```cpp
+const size_t sequence_offset =
+    size_t(blockIdx.y) * size_t(N) * D;
+Q += sequence_offset;
+K += sequence_offset;
+V += sequence_offset;
+O += sequence_offset;
+```
+
+每个 `(batch,head)` 的 softmax 状态完全独立，但所有 head 在同一次 kernel launch 中进入 GPU。使用 `B=2,H=8,N=1024,D=64`，交错 5 轮中位数结果：
+
+| 模式 | v5 BHD 单次 launch | Python 逐 head dispatch | PyTorch SDPA | dispatch/BHD |
+|---|---:|---:|---:|---:|
+| full | 0.7630 ms | 2.3754 ms | 0.2243 ms | **3.11x** |
+| causal | 0.4613 ms | 2.3670 ms | 0.1955 ms | **5.13x** |
+
+二维 grid 消除了 16 次 Python/C++/CUDA launch 的串行提交开销，并把全部 head 的 Q block 一次性暴露给 GPU 调度器。与工业级 SDPA 仍有约 2.4–3.4x 差距，后续方向是支持更多 head dimension、减少手写 fragment load 指令并研究异步流水，而不是把该结果包装成“超过 PyTorch”。可用 `python bench_flashattention_bhd.py` 复现。
+
+### 长序列性能：v3 vs v4 vs v5
+
+使用 [bench_flashattention.py](bench_flashattention.py) 进行 CUDA Event 计时。每组进行 20 次预热、50 次迭代、5 轮采样并取中位数；三个版本交错执行且每轮轮换顺序，以降低 GPU boost、温度和固定执行顺序的影响。v3→v5 是端到端升级；v4→v5 的输入、精度、tile 和数学运算相同，是只改变 P 数据通路的受控实验。
 
 ```bash
 ~/venvs/torch/bin/python bench_flashattention.py
 ```
 
-| N | 模式 | v3 fp32 | v4 fp16 | v3/v4 |
-|---:|---|---:|---:|---:|
-| 1024 | full | 0.3917 ms | 0.1477 ms | 2.65x |
-| 1024 | causal | 0.2164 ms | 0.1874 ms | 1.15x |
-| 4096 | full | 4.6235 ms | 1.1499 ms | 4.02x |
-| 4096 | causal | 2.2017 ms | 0.6787 ms | 3.24x |
-| 8192 | full | 17.3622 ms | 3.5999 ms | 4.82x |
-| 8192 | causal | 8.7591 ms | 2.0900 ms | 4.19x |
+| N | 模式 | v3 fp32 | v4 `Ps` | v5 register P | v4/v5 |
+|---:|---|---:|---:|---:|---:|
+| 1024 | full | 0.4543 ms | 0.1484 ms | 0.1329 ms | 1.12x |
+| 1024 | causal | 0.1682 ms | 0.1120 ms | 0.0985 ms | 1.14x |
+| 4096 | full | 5.1686 ms | 1.3561 ms | 1.0950 ms | 1.24x |
+| 4096 | causal | 2.6260 ms | 0.7487 ms | 0.6908 ms | 1.08x |
+| 8192 | full | 20.8013 ms | 4.2508 ms | 3.3810 ms | **1.26x** |
+| 8192 | causal | 10.5417 ms | 2.4759 ms | 2.1193 ms | **1.17x** |
 
-结论：短序列时 kernel launch 和固定 tile 开销占比高，causal 加速不明显；序列长度增大后，v4 的 Tensor Core 路径优势显现，`N=8192` 时 full/causal 分别达到 4.82x/4.19x。
+结论：v5 在所有测试形状上都快于 v4；收益随 full 长序列增大到 1.26x。它没有减少 HMMA 数量，而是删除每个 KV tile 对 `Ps` 的 shared-memory 写回/重载，并允许每个 SM 多驻留一个 block，用更多 active warp 隐藏 shared-memory/L1 延迟。
 
-### Nsight Compute baseline（N=8192, full）
+### Nsight Compute：v4 vs v5（N=8192, full）
 
 为了避免 `N=1024` 只有 16 个 block、无法填满 30 个 SM 的问题，profile 固定使用 `N=8192`：
 
@@ -107,23 +137,42 @@ v4 测试使用 `N=129`，专门覆盖不是 64 倍数的 K/V 尾块，同时验
   --kernel-name 'regex:flash_fp16_mma' \
   --launch-count 1 \
   ~/venvs/torch/bin/python bench_flashattention.py --n 8192 --mode full
+
+/usr/local/cuda/bin/ncu --set basic \
+  --target-processes all \
+  --kernel-name 'regex:flash_fp16_mma_v5' \
+  --launch-count 1 \
+  ~/venvs/torch/bin/python bench_flashattention.py --n 8192 --mode full
 ```
 
-profile 到的 kernel 是 `flash_fp16_mma<false>`，grid=`128`、block=`128`：
+两版均为 grid=`128`、block=`128`；profile 的多 pass `Duration` 含工具回放开销，性能结论使用上方独立 CUDA Event benchmark，NCU 在这里用于解释资源变化。
 
-| 指标 | 结果 |
-|---|---:|
-| Registers/thread | 101 |
-| Static shared memory/block | 33.28 KB |
-| Theoretical occupancy | 16.67% |
-| Achieved occupancy | 15.50% |
-| Memory throughput | 73.93% |
-| L1/TEX throughput | 87.09% |
-| Compute (SM) throughput | 31.32% |
-| HMMA warp instructions | 4,194,304 |
-| FP16→FP32 Tensor path ops | 17,179,869,184 |
+| 指标 | v4 `Ps` | v5 register P | 变化 |
+|---|---:|---:|---:|
+| Registers/thread | 101 | 99 | -2 |
+| Static shared memory/block | 33.28 KB | 24.96 KB | **-8.32 KB** |
+| Shared-memory block limit/SM | 2 | 3 | **+1 block** |
+| Theoretical occupancy | 16.67% | 25.00% | **+8.33 pp** |
+| Achieved occupancy | 15.55% | 21.28% | **+5.73 pp** |
+| Memory throughput | 74.51% | 71.94% | -2.57 pp |
+| L1/TEX throughput | 85.41% | 86.98% | +1.57 pp |
+| Compute (SM) throughput | 31.57% | 32.96% | +1.39 pp |
 
-Nsight Compute 确认 v4 确实执行了 HMMA Tensor Core 指令。当前主要限制不是 Tensor Core 没有工作，而是 shared memory 导致 occupancy 只有约 16.7%，同时 L1/TEX 利用率高于计算利用率；下一轮优化应优先研究 K/V tile 复用、shared-memory pipeline 和 `cp.async`/`ldmatrix`，而不是继续增加数学计算量。
+`Ps[Bq][Bc+1]` 的尺寸正是 `64×65×2 = 8,320 B`，与 ptxas/NCU 的减少量完全吻合。v5 仍由 shared memory 限制 occupancy，但驻留能力从 2 block/SM 提升到 3 block/SM；实测 1.08x–1.26x 说明这个优化成立，同时也说明 occupancy 提升不等于性能线性提升——指令、同步、L1 和 Tensor Core 流水仍然存在。
+
+### v5 原理：为什么可以删除 `Ps`
+
+QK MMA 的一个 `m16n8k16` 输出 fragment 在每个 lane 中是 4 个 fp32：`c0/c1` 对应第 `g` 行的两个相邻列，`c2/c3` 对应第 `g+8` 行的两个相邻列。softmax 后，`S[t][0..3]` 仍保持这个布局。PV MMA 的 A 操作数需要一个 row-major `16×16` fragment；它恰好可由相邻两个 `16×8` 的 S fragment 拼成：
+
+```cpp
+const int st = b0 / WMMA_N;
+pa0 = half2(S[st][0],     S[st][1]);      // 行 g，   列 0..7
+pa1 = half2(S[st][2],     S[st][3]);      // 行 g+8， 列 0..7
+pa2 = half2(S[st + 1][0], S[st + 1][1]);  // 行 g，   列 8..15
+pa3 = half2(S[st + 1][2], S[st + 1][3]);  // 行 g+8， 列 8..15
+```
+
+v4 的路径是 `S(fp32 registers) → fp16 Ps(smem) → half2 A registers → MMA`；v5 变成 `S(fp32 registers) → half2 A registers → MMA`。两者都会做 fp32→fp16 转换，所以数值结果相同；v5 只消除了 shared-memory store/load 与 `Ps` 的容量。
 
 ### 为什么是这个结果
 
@@ -137,17 +186,19 @@ Nsight Compute 确认 v4 确实执行了 HMMA Tensor Core 指令。当前主要�
 ```
 torch_ext/
 ├── csrc/
-│   ├── bindings.cpp           # PyBind11 绑定：统一暴露 7 个 forward
+│   ├── bindings.cpp           # PyBind11 绑定：统一暴露 8 个 forward
 │   ├── ops.h                  # 入口函数声明
 │   ├── rmsnorm_cuda.cu        # 各算子：CUDA kernel + torch::Tensor 包装
 │   ├── softmax_cuda.cu
 │   ├── layernorm_cuda.cu
 │   ├── gemm_cuda.cu
 │   ├── flashattention_cuda.cu       # FlashAttention v3，fp32 baseline
-│   └── flashattention_mma_cuda.cu  # FlashAttention v4，fp16 Tensor Core
+│   ├── flashattention_mma_cuda.cu  # FlashAttention v4，fp16 Tensor Core + Ps
+│   └── flashattention_v5_cuda.cu   # FlashAttention v5，P fragment 寄存器直连
 ├── setup.py                   # CUDAExtension 单模块构建
 ├── test_all.py                # 全量正确性对拍 + 基础 benchmark
-└── bench_flashattention.py    # v3/v4 长序列 CUDA Event benchmark
+├── bench_flashattention.py    # v3/v4/v5 交错、轮换顺序 benchmark
+└── bench_flashattention_bhd.py # v5 BHD vs 逐 head dispatch vs PyTorch SDPA
 ```
 
 ## 关键点（面试常问）

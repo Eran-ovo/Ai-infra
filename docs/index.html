@@ -58,10 +58,10 @@
     </div>
 
     <div class="card">
-      <span class="kind">注意力 · 4 版</span>
+      <span class="kind">注意力 · 5 版</span>
       <h3>FlashAttention</h3>
       <p><strong>主线</strong>：分块 + Online Softmax，让中间 S 矩阵永不落地 HBM；再逐步 FA2 化（warp-per-row → Tensor Core）。</p>
-      <p><strong>覆盖</strong>：v1 online softmax → v2 causal → v3 warp-per-row → v4 fp16 mma</p>
+      <p><strong>覆盖</strong>：v1 online softmax → v2 causal → v3 warp-per-row → v4 fp16 mma + Ps → v5 register P</p>
       <a class="more" href="flashattention.html">详读原理与区别 →</a>
     </div>
 

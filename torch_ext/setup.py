@@ -16,8 +16,9 @@ setup(
                 "csrc/gemm_mma_cuda.cu",       # fp16 Tensor Core GEMM（手写 mma.sync）
                 "csrc/flashattention_cuda.cu",
                 "csrc/flashattention_mma_cuda.cu",  # FlashAttention v4（fp16 Tensor Core）
+                "csrc/flashattention_v5_cuda.cu",   # FlashAttention v5（P fragment 寄存器直连）
             ],
-            extra_cuda_cflags=["-O3"],
+            extra_compile_args={"cxx": ["-O3"], "nvcc": ["-O3"]},
         )
     ],
     cmdclass={"build_ext": BuildExtension},

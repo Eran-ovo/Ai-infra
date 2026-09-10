@@ -46,6 +46,8 @@ nvcc -O3 -I/home/eran/cutlass/include kernels/gemm_v3_cutlass.cu -o benchmarks/g
 | FlashAttention | v1（分块 + Online Softmax，S 矩阵不落地 HBM） | N=512, D=64, Br/Bc=32 | 0.199 ms | - | PASS (maxErr=2.4e-07) |
 | FlashAttention | v2（v1 + causal mask，模板双模式） | N=8192, D=64, Br=256 | full 9.43 / causal 4.71 ms | 2.00x | PASS (maxErr=6.4e-07) |
 | FlashAttention | v3（一 warp 一行 + smem padding 消 bank conflict） | N=8192, D=64, Br=256 | full 17.7 / causal 8.8 ms | 2.01x | PASS (maxErr=2.4e-07) |
+| FlashAttention | v4（fp16 Tensor Core，P 经 shared-memory `Ps` 中转） | N=8192, D=64 | full 4.2508 / causal 2.4759 ms | - | PASS (N=129 tail maxErr=9.8e-04) |
+| FlashAttention | v5（v4 + P fragment 寄存器直连） | N=8192, D=64 | full 3.3810 / causal 2.1193 ms | v4/v5=1.26x/1.17x | PASS (与 v4 误差相同) |
 
 > 注：WSL2 下 GPU 频率有波动，数据为多轮运行的代表值；GEMM v0-v3 为 20 次平均，GEMM v4 为 50 轮平均（bench_avg.py，pytorch 算子，含预热），Softmax/LayerNorm/RMSNorm/FlashAttention 为 100 次平均（均含预热）。
 
@@ -105,6 +107,19 @@ v2 的 fp32 FMA 版在 1024³ 是 789 GFLOPS，v4 换成手写 `mma.sync.aligned
 
 **测量口径差异（重要）**：单次计时 vs 多次平均差明显。1024³ 单次 0.754ms（2847 GFLOPS）但 20 次平均 0.448ms（4800 GFLOPS）——首轮 kernel 启动有上下文/冷缓存/未达稳态频率的开销。同尺寸下两种口径都记录，避免"到底多少 GFLOPS"的歧义。另：`gemm_mma` 是 fp32 累加，`torch.matmul` 对 fp16 输入默认 fp16 累加（更快但不精确），故 cuBLAS 对照值偏乐观；公平对比应看 .cu 里 `cublasGemmEx` 的 fp16-in/fp32-out（~10.3 TFLOPS）。
 
+**FlashAttention v5：删除 P 的 shared-memory 中转**（2026-09-10）：
+
+v4 在 QK MMA 和 online softmax 后，把寄存器中的概率写入 `Ps[64][65]`，随后按 PV MMA 的 A-fragment 布局重新加载。观察到 QK 的两个相邻 `m16n8` 输出 fragment 本身就能拼成 PV 所需的 row-major `m16k16` A fragment，因此 v5 直接把 `S[t]`/`S[t+1]` 转成 `pa0..pa3`，删除 `Ps`。
+
+| 指标（N=8192 full） | v4 | v5 |
+|---|---:|---:|
+| Static shared memory/block | 33.28 KB | 24.96 KB |
+| 可驻留 block/SM（smem 限制） | 2 | 3 |
+| 理论 / 实测 occupancy | 16.67% / 15.55% | 25.00% / 21.28% |
+| CUDA Event 耗时 | 4.2508 ms | 3.3810 ms |
+
+减少的 `8,320 B = 64×65×sizeof(half)` 与 `Ps` 尺寸严格吻合。v4/v5 使用相同输入、精度、tile、HMMA 数量和交错计时，因而 1.26x 提速可以归因于移除 shared-memory store/load 并提高并发驻留。这个实验也说明：优化应形成“资源假设 → 单变量代码变化 → 正确性 → benchmark → NCU 解释”的证据链。
+
 
 ## 实现要点
 
@@ -119,3 +134,6 @@ v2 的 fp32 FMA 版在 1024³ 是 789 GFLOPS，v4 换成手写 `mma.sync.aligned
 - **flashattention_v1**: FlashAttention 前向。Q 行驻留寄存器，K/V 按块搬入 Shared Memory，维护 running max / sum / acc 做 Online Softmax，中间 S 矩阵永不写回 HBM。
 - **flashattention_v2**: v1 + causal mask（GPT 自回归必备）。`template<bool IS_CAUSAL>` 编译期双模式零开销；kv 循环上界按 block 粒度截断（`q_row_max/Bc+1`）整块跳过未来信息，对角线块逐元素 mask；N=8192 时 causal 达 2.00x 理论加速。
 - **flashattention_v3**: FA2 的核心重划分——一 warp 一行 Q（v2 是一线程一行）。每 lane 只存 DQ=D/32=2 维（`q_reg[2]+acc[2]`），寄存器 255→40/thread，occupancy 2%→79%。Q 行入 smem，每 lane 独立算完整点积（避开 causal 分支下 shuffle 死锁）；`Ktile/Vtile[Bc][D+1]` padding 消除列访问的 32 路 bank conflict（提速 1.9x）。仍比 v2 慢 1.8x：K/V 随 block 数增多而重复搬运 + Q 点积冗余，说明 occupancy 与算术强度需平衡。
+- **flashattention_v4**: QKᵀ 与 PV 都改为手写 `mma.sync.m16n8k16`，fp16 输入、fp32 softmax/累加；保留 full/causal 和任意 N 的 K/V tail mask。softmax 概率先写入 padded `Ps[64][65]`，再按 PV 的 A fragment 布局重载，是便于验证 fragment 映射的清晰基线。
+- **flashattention_v5**: 复用 QK 输出 fragment 的寄存器布局，把相邻两个 `16×8` 的 P tile 直接拼成 PV 的 `16×16` A fragment，删除 `Ps` 中转。shared memory 33.28→24.96 KB，理论 occupancy 16.67%→25%（实测 15.55%→21.28%），N=8192 full/causal 相对 v4 提速 1.26x/1.17x。
+- **flashattention_v5 BHD**: 同一 kernel 兼容 `[N,64]` 和连续 `[B,H,N,64]`；`grid.x` 枚举 Q block，`grid.y` 枚举展平的 batch×head。B=2/H=8/N=1024 时，一次 BHD launch 相比 Python 逐 head dispatch 在 full/causal 分别快 3.11x/5.13x，并与 PyTorch SDPA 完成正确性对拍。

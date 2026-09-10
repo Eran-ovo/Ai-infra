@@ -14,6 +14,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("flashattention", &flashattention_forward, "FlashAttention forward (CUDA, online softmax)",
           py::arg("q"), py::arg("k"), py::arg("v"), py::arg("causal") = false);
     m.def("flashattention_fp16", &flashattention_fp16_forward,
-          "FlashAttention v4 forward (CUDA, fp16 Tensor Core mma.sync)",
+          "FlashAttention v4 forward (CUDA, fp16 Tensor Core, shared-memory P)",
+          py::arg("q"), py::arg("k"), py::arg("v"), py::arg("causal") = false);
+    m.def("flashattention_v5", &flashattention_v5_forward,
+          "FlashAttention v5 forward (CUDA, fp16 Tensor Core, register P fragment)",
           py::arg("q"), py::arg("k"), py::arg("v"), py::arg("causal") = false);
 }
