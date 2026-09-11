@@ -9,7 +9,7 @@ docs/
 ├── index.html            # 总览：三类算子 + 封装节课导航 + 共同地基（分块/合并访存/bank conflict/归约/occupancy）
 ├── gemm.html             # GEMM 类：v0 朴素 → v1 tiling → v2 ldg → v3 CUTLASS → v4 mma
 ├── normalization.html    # 归约/归一化类：Softmax / LayerNorm / RMSNorm
-├── flashattention.html   # FlashAttention 类：v1 分块 → v2 causal → v3 warp-per-row → v4 fp16 mma → v5 register P
+├── flashattention.html   # FlashAttention 类：v1 分块 → v2 causal → v3 warp-per-row → v4 fp16 mma → v5 register P → v6 D=128
 ├── torch_ext.html        # PyTorch 封装：ai_infra_ops 模块、包装层、面试关键点、实测对比
 ├── assets/
 │   └── style.css         # 共享样式（所有分类页共用同一份）
@@ -22,8 +22,8 @@ docs/
 |----|---------|------|
 | GEMM | tiling 复用 + 访存优化 + 换硬件 | gemm_v0/v1/v2/v3_cutlass/v4_mma |
 | 归约/归一化 | 块内树形归约 + warp shuffle，fusion 一次写回 | softmax / layernorm / rmsnorm |
-| FlashAttention | 分块 + online softmax（S 不落 HBM） | flashattention_v1/v2/v3/v4/v5 |
-| PyTorch 封装 | 手写 kernel → torch 算子（包装层 + 绑定 + 校验） | torch_ext/csrc/*（8 个 forward） |
+| FlashAttention | 分块 + online softmax（S 不落 HBM） | flashattention_v1/v2/v3/v4/v5/v6 |
+| PyTorch 封装 | 手写 kernel → torch 算子（包装层 + 绑定 + 校验） | torch_ext/csrc/*（9 个 forward） |
 
 ## 如何扩展
 

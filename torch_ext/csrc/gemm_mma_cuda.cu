@@ -1,8 +1,14 @@
 // FP16 Tensor Core GEMM（手写 mma.sync.m16n8k16）的 PyTorch 包装
 // 与 kernels/gemm_v4_mma.cu 同源，差异只在输入输出换成 torch::Tensor
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <ATen/cuda/Exceptions.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
+#include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <climits>
 
 // 块级 tile：每个 block 算 64x64 的 C 块，K 方向每轮 BK=16
 #define BM 64
@@ -104,14 +110,15 @@ __global__ void gemm_mma(const __half* __restrict__ A,
         int mr = m_base + warp_m * WMMA_M;
         // c0=(g, gid*2) c1=(g, gid*2+1) c2=(g+8, gid*2) c3=(g+8, gid*2+1)
         int r0 = mr + g, c0 = nc + gid * 2, r2 = mr + g + 8;
-        if (r0 < M && c0 + 1 < N) {
-            C[r0 * N + c0]     = acc[t][0];
+        if (r0 < M && c0 < N)
+            C[r0 * N + c0] = acc[t][0];
+        if (r0 < M && c0 + 1 < N)
             C[r0 * N + c0 + 1] = acc[t][1];
-        }
-        if (r2 < M && c0 + 1 < N) {
-            C[r2 * N + c0]     = acc[t][2];
+
+        if (r2 < M && c0 < N)
+            C[r2 * N + c0] = acc[t][2];
+        if (r2 < M && c0 + 1 < N)
             C[r2 * N + c0 + 1] = acc[t][3];
-        }
     }
 }
 
@@ -122,17 +129,82 @@ torch::Tensor gemm_mma_forward(torch::Tensor a, torch::Tensor b) {
     TORCH_CHECK(a.dtype() == torch::kHalf && b.dtype() == torch::kHalf, "a/b must be fp16");
     TORCH_CHECK(a.dim() == 2 && b.dim() == 2, "a/b must be 2D");
     TORCH_CHECK(a.is_contiguous() && b.is_contiguous(), "a/b must be contiguous");
+    TORCH_CHECK(a.device() == b.device(), "a/b must be on the same CUDA device");
 
-    const int M = a.size(0);
-    const int K = a.size(1);
-    TORCH_CHECK(b.size(0) == K, "inner dim mismatch: a is [M,K], b must be [K,N]");
-    const int N = b.size(1);
+    const int64_t M64 = a.size(0);
+    const int64_t K64 = a.size(1);
+    const int64_t N64 = b.size(1);
+    TORCH_CHECK(b.size(0) == K64, "inner dim mismatch: a is [M,K], b must be [K,N]");
+    TORCH_CHECK(M64 <= INT_MAX && N64 <= INT_MAX && K64 <= INT_MAX,
+                "M/N/K are too large for the CUDA kernel");
+    TORCH_CHECK((M64 + BM - 1) / BM <= 65535,
+                "M exceeds the CUDA grid.y limit for this kernel");
 
-    auto c = torch::empty({M, N}, a.options().dtype(torch::kFloat32));
+    c10::cuda::CUDAGuard device_guard(a.device());
 
-    dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+    auto c = torch::empty({M64, N64}, a.options().dtype(torch::kFloat32));
+    if (M64 == 0 || N64 == 0)
+        return c;
+    if (K64 == 0) {
+        c.zero_();
+        return c;
+    }
+
+    const int M = static_cast<int>(M64);
+    const int N = static_cast<int>(N64);
+    const int K = static_cast<int>(K64);
+    dim3 grid(static_cast<unsigned>((N64 + BN - 1) / BN),
+              static_cast<unsigned>((M64 + BM - 1) / BM));
     const __half* pa = reinterpret_cast<const __half*>(a.data_ptr<at::Half>());
     const __half* pb = reinterpret_cast<const __half*>(b.data_ptr<at::Half>());
-    gemm_mma<<<grid, WM * WN * 32>>>(pa, pb, c.data_ptr<float>(), M, N, K);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    gemm_mma<<<grid, WM * WN * 32, 0, stream>>>(pa, pb, c.data_ptr<float>(), M, N, K);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return c;
+}
+
+// 公平 benchmark 基线：与 gemm_mma_forward 完全相同的输入/累加/输出语义。
+// cuBLAS 按列主序解释矩阵；交换 A/B 后计算 B^T @ A^T，内存中正好是行主序 A @ B。
+torch::Tensor gemm_cublas_fp32_forward(torch::Tensor a, torch::Tensor b) {
+    TORCH_CHECK(a.is_cuda() && b.is_cuda(), "a/b must be CUDA tensors");
+    TORCH_CHECK(a.dtype() == torch::kHalf && b.dtype() == torch::kHalf, "a/b must be fp16");
+    TORCH_CHECK(a.dim() == 2 && b.dim() == 2, "a/b must be 2D");
+    TORCH_CHECK(a.is_contiguous() && b.is_contiguous(), "a/b must be contiguous");
+    TORCH_CHECK(a.device() == b.device(), "a/b must be on the same CUDA device");
+
+    const int64_t M64 = a.size(0);
+    const int64_t K64 = a.size(1);
+    const int64_t N64 = b.size(1);
+    TORCH_CHECK(b.size(0) == K64, "inner dim mismatch: a is [M,K], b must be [K,N]");
+    TORCH_CHECK(M64 <= INT_MAX && N64 <= INT_MAX && K64 <= INT_MAX,
+                "M/N/K are too large for cuBLAS int dimensions");
+
+    c10::cuda::CUDAGuard device_guard(a.device());
+    auto c = torch::empty({M64, N64}, a.options().dtype(torch::kFloat32));
+    if (M64 == 0 || N64 == 0)
+        return c;
+    if (K64 == 0) {
+        c.zero_();
+        return c;
+    }
+
+    const int M = static_cast<int>(M64);
+    const int N = static_cast<int>(N64);
+    const int K = static_cast<int>(K64);
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+
+    TORCH_CUDABLAS_CHECK(cublasGemmEx(
+        handle,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        N, M, K,
+        &alpha,
+        b.data_ptr<at::Half>(), CUDA_R_16F, N,
+        a.data_ptr<at::Half>(), CUDA_R_16F, K,
+        &beta,
+        c.data_ptr<float>(), CUDA_R_32F, N,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT));
     return c;
 }

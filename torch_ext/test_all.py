@@ -1,23 +1,11 @@
-# 全量测试：所有算子的正确性对拍、FlashAttention 边界/BHD 回归与基础 benchmark
-import time
+# 全量测试：只验证正确性、边界条件与 PyTorch CUDA 调用契约。
+# 性能测试单独放在 bench_ops.py，避免测试与 benchmark 相互污染。
 import torch
 import torch.nn.functional as F
 import ai_infra_ops
 
 torch.manual_seed(42)
 device = "cuda"
-
-
-def bench(fn, iters=200):
-    for _ in range(20):
-        fn()  # warmup
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    for _ in range(iters):
-        fn()
-    torch.cuda.synchronize()
-    return (time.perf_counter() - t0) / iters * 1000  # ms
-
 
 def check(name, out, ref, tol=1e-3):
     err = (out - ref).abs().max().item()
@@ -36,17 +24,11 @@ g = torch.rand(N, device=device) + 0.5
 ref = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * g
 out = ai_infra_ops.rmsnorm(x, g, eps)
 check("RMSNorm", out, ref, 1e-4)
-t_mine = bench(lambda: ai_infra_ops.rmsnorm(x, g, eps))
-t_torch = bench(lambda: x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * g)
-print(f"  custom {t_mine:.4f} ms | torch {t_torch:.4f} ms | {t_torch/t_mine:.2f}x")
 
 # ---------------- Softmax ----------------
 out = ai_infra_ops.softmax(x)
 ref = torch.softmax(x, dim=-1)
 check("Softmax", out, ref)
-t_mine = bench(lambda: ai_infra_ops.softmax(x))
-t_torch = bench(lambda: torch.softmax(x, dim=-1))
-print(f"  custom {t_mine:.4f} ms | torch {t_torch:.4f} ms | {t_torch/t_mine:.2f}x")
 
 # ---------------- LayerNorm（无 affine，对拍需去掉 gamma/beta） ----------------
 out = ai_infra_ops.layernorm(x, eps)
@@ -54,9 +36,6 @@ mean = x.mean(-1, keepdim=True)
 var = x.var(-1, unbiased=False, keepdim=True)
 ref = (x - mean) / torch.sqrt(var + eps)
 check("LayerNorm", out, ref)
-t_mine = bench(lambda: ai_infra_ops.layernorm(x, eps))
-t_torch = bench(lambda: (x - x.mean(-1, keepdim=True)) / torch.sqrt(x.var(-1, unbiased=False, keepdim=True) + eps))
-print(f"  custom {t_mine:.4f} ms | torch {t_torch:.4f} ms | {t_torch/t_mine:.2f}x")
 
 # ---------------- GEMM ----------------
 M, K, Nn = 1024, 1024, 1024
@@ -65,9 +44,31 @@ b = torch.randn(K, Nn, device=device)
 out = ai_infra_ops.gemm(a, b)
 ref = a @ b
 check("GEMM", out, ref, 0.5)  # fp32 tiled 累加顺序不同，容差放宽
-t_mine = bench(lambda: ai_infra_ops.gemm(a, b), iters=20)
-t_torch = bench(lambda: a @ b, iters=20)
-print(f"  custom {t_mine:.4f} ms | torch {t_torch:.4f} ms | {t_torch/t_mine:.2f}x")
+
+# ---------------- GEMM MMA 边界回归 ----------------
+# 覆盖小矩阵、奇数 N，以及 M/N/K 均非 Tensor Core tile 整数倍的情况。
+gemm_mma_shapes = (
+    (1, 1, 1),
+    (3, 5, 7),
+    (63, 15, 65),
+    (65, 17, 33),
+    (127, 129, 131),
+)
+max_gemm_mma_err = 0.0
+for m, k_dim, n in gemm_mma_shapes:
+    a16 = torch.randn(m, k_dim, device=device, dtype=torch.float16)
+    b16 = torch.randn(k_dim, n, device=device, dtype=torch.float16)
+    out = ai_infra_ops.gemm_mma(a16, b16)
+    cublas_out = ai_infra_ops.gemm_cublas_fp32(a16, b16)
+    ref = a16.float() @ b16.float()
+    max_gemm_mma_err = max(
+        max_gemm_mma_err,
+        (out - ref).abs().max().item(),
+    )
+    torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(cublas_out, ref, rtol=2e-2, atol=2e-2)
+
+print(f"[GEMM MMA edge suite] PASS  maxErr={max_gemm_mma_err:.3e}")
 
 # ---------------- FlashAttention（v3：N=8192 D=64） ----------------
 N2 = 8192
@@ -88,9 +89,6 @@ out_full = ai_infra_ops.flashattention(q, k, v, False)
 out_causal = ai_infra_ops.flashattention(q, k, v, True)
 check("FlashAttention full", out_full, torch_attn(False), 1e-2)
 check("FlashAttention causal", out_causal, torch_attn(True), 1e-2)
-t_mine_f = bench(lambda: ai_infra_ops.flashattention(q, k, v, False), iters=20)
-t_mine_c = bench(lambda: ai_infra_ops.flashattention(q, k, v, True), iters=20)
-print(f"  custom full {t_mine_f:.4f} ms | causal {t_mine_c:.4f} ms | causal speedup {t_mine_f/t_mine_c:.2f}x")
 
 # ---------------- FlashAttention v4（fp16 Tensor Core，含尾块 + causal） ----------------
 # N=129 专门覆盖不是 64 倍数的 K/V 尾块；v4 的 Q/K/V 与输出均为 fp16。
@@ -111,18 +109,12 @@ out = ai_infra_ops.flashattention_fp16(q16, k16, v16, False)
 check("FlashAttention v4 full", out.float(), torch_attn_fp16(False).float(), 2e-2)
 out = ai_infra_ops.flashattention_fp16(q16, k16, v16, True)
 check("FlashAttention v4 causal", out.float(), torch_attn_fp16(True).float(), 2e-2)
-t_v4_f = bench(lambda: ai_infra_ops.flashattention_fp16(q16, k16, v16, False), iters=50)
-t_v4_c = bench(lambda: ai_infra_ops.flashattention_fp16(q16, k16, v16, True), iters=50)
-print(f"  v4 full {t_v4_f:.4f} ms | causal {t_v4_c:.4f} ms | causal speedup {t_v4_f/t_v4_c:.2f}x")
 
 # ---------------- FlashAttention v5（P fragment 寄存器直连） ----------------
 out = ai_infra_ops.flashattention_v5(q16, k16, v16, False)
 check("FlashAttention v5 full", out.float(), torch_attn_fp16(False).float(), 2e-2)
 out = ai_infra_ops.flashattention_v5(q16, k16, v16, True)
 check("FlashAttention v5 causal", out.float(), torch_attn_fp16(True).float(), 2e-2)
-t_v5_f = bench(lambda: ai_infra_ops.flashattention_v5(q16, k16, v16, False), iters=50)
-t_v5_c = bench(lambda: ai_infra_ops.flashattention_v5(q16, k16, v16, True), iters=50)
-print(f"  v5 full {t_v5_f:.4f} ms | causal {t_v5_c:.4f} ms | causal speedup {t_v5_f/t_v5_c:.2f}x")
 
 # ---------------- FlashAttention v4/v5 边界回归 ----------------
 # 同时覆盖 Bq/Bc=64 的边界前、边界上、边界后以及多个 KV tile。
@@ -177,3 +169,87 @@ for causal in (False, True):
         ref.float(),
         2e-2,
     )
+
+# ---------------- FlashAttention v6 D=128 ----------------
+# D=128 会把 Q/K/V 的 shared-memory stride 和 PV 输出 tile 数都翻倍。
+B6, H6, N6, D6 = 2, 2, 65, 128
+q128 = torch.randn(B6, H6, N6, D6, device=device, dtype=torch.float16)
+k128 = torch.randn_like(q128)
+v128 = torch.randn_like(q128)
+for causal in (False, True):
+    out = ai_infra_ops.flashattention_v6(q128, k128, v128, causal)
+    ref = F.scaled_dot_product_attention(q128, k128, v128, is_causal=causal)
+    check(
+        f"FlashAttention v6 D128 {'causal' if causal else 'full'}",
+        out.float(),
+        ref.float(),
+        3e-2,
+    )
+
+# ---------------- PyTorch CUDA stream / 输入契约回归 ----------------
+# 输入生产、手写算子和 reference 全部排入同一条非默认 stream。若 wrapper
+# 错误地把 kernel 发往默认 stream，kernel 可能在输入尚未生成时就开始读取。
+test_stream = torch.cuda.Stream()
+with torch.cuda.stream(test_stream):
+    if hasattr(torch.cuda, "_sleep"):
+        torch.cuda._sleep(5_000_000)
+
+    xs = torch.randn(17, 70, device=device)
+    gs = torch.rand(70, device=device) + 0.5
+    rms_out = ai_infra_ops.rmsnorm(xs, gs, eps)
+    rms_ref = xs * torch.rsqrt(xs.pow(2).mean(-1, keepdim=True) + eps) * gs
+
+    softmax_out = ai_infra_ops.softmax(xs)
+    softmax_ref = torch.softmax(xs, dim=-1)
+
+    layernorm_out = ai_infra_ops.layernorm(xs, eps)
+    layernorm_ref = (xs - xs.mean(-1, keepdim=True)) / torch.sqrt(
+        xs.var(-1, unbiased=False, keepdim=True) + eps
+    )
+
+    ga = torch.randn(35, 19, device=device)
+    gb = torch.randn(19, 27, device=device)
+    gemm_out = ai_infra_ops.gemm(ga, gb)
+    gemm_ref = ga @ gb
+
+    ga16 = ga.half()
+    gb16 = gb.half()
+    gemm_mma_out = ai_infra_ops.gemm_mma(ga16, gb16)
+    gemm_cublas_out = ai_infra_ops.gemm_cublas_fp32(ga16, gb16)
+    gemm_mma_ref = ga16.float() @ gb16.float()
+
+    sq = torch.randn(65, 64, device=device)
+    sk = torch.randn_like(sq)
+    sv = torch.randn_like(sq)
+    flash_out = ai_infra_ops.flashattention(sq, sk, sv, False)
+    flash_ref = torch.softmax((sq @ sk.T) * (64 ** -0.5), dim=-1) @ sv
+
+test_stream.synchronize()
+check("RMSNorm non-default stream", rms_out, rms_ref, 1e-4)
+check("Softmax non-default stream", softmax_out, softmax_ref, 1e-4)
+check("LayerNorm non-default stream", layernorm_out, layernorm_ref, 1e-4)
+check("GEMM non-default stream", gemm_out, gemm_ref, 1e-4)
+check("GEMM MMA non-default stream", gemm_mma_out, gemm_mma_ref, 2e-2)
+check("cuBLAS baseline non-default stream", gemm_cublas_out, gemm_mma_ref, 2e-2)
+check("FlashAttention v3 non-default stream", flash_out, flash_ref, 1e-2)
+
+# 空 batch 可以直接返回空输出；K=0 的 GEMM 按数学语义返回全零。
+empty_x = torch.empty(0, 17, device=device)
+empty_g = torch.ones(17, device=device)
+assert ai_infra_ops.rmsnorm(empty_x, empty_g, eps).shape == empty_x.shape
+assert ai_infra_ops.softmax(empty_x).shape == empty_x.shape
+assert ai_infra_ops.layernorm(empty_x, eps).shape == empty_x.shape
+zero_k_out = ai_infra_ops.gemm(
+    torch.empty(3, 0, device=device), torch.empty(0, 5, device=device)
+)
+assert zero_k_out.shape == (3, 5) and torch.count_nonzero(zero_k_out).item() == 0
+
+# 防止 fp16 权重被 reinterpret_cast 成 float* 后静默产生错误结果。
+try:
+    ai_infra_ops.rmsnorm(xs, gs.half(), eps)
+except RuntimeError as exc:
+    assert "float32" in str(exc)
+else:
+    raise AssertionError("RMSNorm must reject a non-float32 weight")
+
+print("[PyTorch CUDA contract suite] PASS")

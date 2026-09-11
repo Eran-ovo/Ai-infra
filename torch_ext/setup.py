@@ -17,7 +17,9 @@ setup(
                 "csrc/flashattention_cuda.cu",
                 "csrc/flashattention_mma_cuda.cu",  # FlashAttention v4（fp16 Tensor Core）
                 "csrc/flashattention_v5_cuda.cu",   # FlashAttention v5（P fragment 寄存器直连）
+                "csrc/flashattention_v6_cuda.cu",   # FlashAttention v6（D=128 实验版）
             ],
+            libraries=["cublas"],
             extra_compile_args={"cxx": ["-O3"], "nvcc": ["-O3"]},
         )
     ],

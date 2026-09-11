@@ -2,7 +2,11 @@
 // 与 kernels/flashattention_v3.cu 同源（一 warp 一行 + smem padding 消 bank conflict）
 // 差异只在：输入输出换成 torch::Tensor，causal 由运行时 bool 派发到模板实例
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
 #include <cuda_runtime.h>
+#include <climits>
 
 #define WARP 32
 #define Br   256              // 每 block 线程数 = 8 warp = 8 行 Q
@@ -113,19 +117,27 @@ torch::Tensor flashattention_forward(torch::Tensor q, torch::Tensor k, torch::Te
     TORCH_CHECK(q.dim() == 2 && k.dim() == 2 && v.dim() == 2, "q/k/v must be [N, D]");
     TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous(),
                 "q/k/v must be contiguous");
+    TORCH_CHECK(q.device() == k.device() && q.device() == v.device(),
+                "q/k/v must be on the same CUDA device");
 
-    const int N = q.size(0);
+    const int64_t N64 = q.size(0);
+    TORCH_CHECK(N64 > 0 && N64 <= INT_MAX, "N must be in [1, INT_MAX]");
     TORCH_CHECK(q.size(1) == D, "feature dim must be 64 (v3 kernel 编译期固定 D=64)");
-    TORCH_CHECK(k.size(0) == N && v.size(0) == N && k.size(1) == D && v.size(1) == D,
+    TORCH_CHECK(k.size(0) == N64 && v.size(0) == N64 && k.size(1) == D && v.size(1) == D,
                 "q/k/v must 同形状 [N, 64]");
 
+    c10::cuda::CUDAGuard device_guard(q.device());
+
     auto o = torch::empty_like(q);
-    const int grid = (N + ROWS_PER_BLK - 1) / ROWS_PER_BLK;
+    const int N = static_cast<int>(N64);
+    const int grid = static_cast<int>((N64 + ROWS_PER_BLK - 1) / ROWS_PER_BLK);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
     if (causal)
-        flash_fwd<true><<<grid, Br>>>(q.data_ptr<float>(), k.data_ptr<float>(),
-                                      v.data_ptr<float>(), o.data_ptr<float>(), N);
+        flash_fwd<true><<<grid, Br, 0, stream>>>(q.data_ptr<float>(), k.data_ptr<float>(),
+                                                 v.data_ptr<float>(), o.data_ptr<float>(), N);
     else
-        flash_fwd<false><<<grid, Br>>>(q.data_ptr<float>(), k.data_ptr<float>(),
-                                       v.data_ptr<float>(), o.data_ptr<float>(), N);
+        flash_fwd<false><<<grid, Br, 0, stream>>>(q.data_ptr<float>(), k.data_ptr<float>(),
+                                                  v.data_ptr<float>(), o.data_ptr<float>(), N);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     return o;
 }

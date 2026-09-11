@@ -1,15 +1,19 @@
 // Softmax 的 CUDA kernel + PyTorch 包装
 // 与 kernels/softmax_v1.cu 同源，差异只在输入输出换成 torch::Tensor
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
 #include <cuda_runtime.h>
+#include <climits>
 
 #define BLOCK 256
 
 // softmax(x) = exp(x-max) / sum(exp(x-max))，一行一个 block，两次归约 max -> sum
 __global__ void softmax_fused(const float* __restrict__ x, float* __restrict__ y, int N) {
     int row = blockIdx.x;
-    const float* row_x = x + row * N;
-    float* row_y = y + row * N;
+    const float* row_x = x + (size_t)row * N;
+    float* row_y = y + (size_t)row * N;
     __shared__ float sdata[BLOCK];
     int tid = threadIdx.x;
 
@@ -63,10 +67,21 @@ torch::Tensor softmax_forward(torch::Tensor x) {
     TORCH_CHECK(x.dim() == 2, "x must be [B, N]");
     TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
 
-    const int B = x.size(0);
-    const int N = x.size(1);
+    const int64_t B64 = x.size(0);
+    const int64_t N64 = x.size(1);
+    TORCH_CHECK(B64 <= INT_MAX, "B is too large for the CUDA kernel");
+    TORCH_CHECK(N64 > 0 && N64 <= INT_MAX, "N must be in [1, INT_MAX]");
+
+    c10::cuda::CUDAGuard device_guard(x.device());
 
     auto y = torch::empty_like(x);
-    softmax_fused<<<B, BLOCK>>>(x.data_ptr<float>(), y.data_ptr<float>(), N);
+    if (B64 == 0)
+        return y;
+
+    const int B = static_cast<int>(B64);
+    const int N = static_cast<int>(N64);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    softmax_fused<<<B, BLOCK, 0, stream>>>(x.data_ptr<float>(), y.data_ptr<float>(), N);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     return y;
 }

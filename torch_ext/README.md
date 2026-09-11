@@ -1,6 +1,6 @@
 # torch_ext：把手写 CUDA kernel 封装成 PyTorch 算子
 
-把 `kernels/` 下 5 类手写 CUDA kernel（GEMM / Softmax / LayerNorm / RMSNorm / FlashAttention）统一封装成一个 PyTorch Extension 模块 `ai_infra_ops`，当前暴露 8 个 Python 入口。
+把 `kernels/` 下 5 类手写 CUDA kernel（GEMM / Softmax / LayerNorm / RMSNorm / FlashAttention）统一封装成一个 PyTorch Extension 模块 `ai_infra_ops`。当前暴露 9 个手写算子入口，以及 1 个只用于公平测速的 cuBLAS 基线入口。
 
 ## 环境
 
@@ -19,6 +19,7 @@ export PATH=~/venvs/torch/bin:/usr/local/cuda/bin:$PATH
 export TORCH_CUDA_ARCH_LIST="8.6"   # RTX 3060 Laptop = Ampere sm_86
 ~/venvs/torch/bin/python setup.py build_ext --inplace
 ~/venvs/torch/bin/python test_all.py
+~/venvs/torch/bin/python bench_ops.py
 ```
 
 ## API
@@ -32,29 +33,52 @@ ai_infra_ops.softmax(x)                  # x [B,N] fp32，沿 axis=-1
 ai_infra_ops.layernorm(x, eps)           # x [B,N] fp32，无 affine
 ai_infra_ops.gemm(a, b)                  # a [M,K] b [K,N] fp32 -> [M,N]
 ai_infra_ops.gemm_mma(a, b)              # a [M,K] b [K,N] fp16 -> [M,N] fp32（手写 Tensor Core）
+ai_infra_ops.gemm_cublas_fp32(a, b)       # 同语义 cuBLAS 基线，仅用于 benchmark
 ai_infra_ops.flashattention(q, k, v, causal)  # q/k/v [N,64] fp32
 ai_infra_ops.flashattention_fp16(q, k, v, causal)  # v4：fp16 Tensor Core，P 经 Ps 中转
 ai_infra_ops.flashattention_v5(q, k, v, causal)    # v5：[N,64] 或 [B,H,N,64]，P fragment 寄存器直连
+ai_infra_ops.flashattention_v6(q, k, v, causal)    # v6：[N,128] 或 [B,H,N,128]，D=128 实验版
 ```
 
-## 实测结果（RTX 3060 Laptop，同会话交错计时，test_all.py 复现）
+## 实测结果（RTX 3060 Laptop，`bench_ops.py` 复现）
 
-| 算子 | 手写 CUDA | PyTorch 原生 | 加速比 |
+| 算子 | 手写 CUDA | 同语义基线 | baseline/custom |
 |------|----------|-------------|--------|
-| RMSNorm (B=1024 N=1024) | 0.0391 ms | 0.1131 ms | 2.89x |
-| Softmax (B=1024 N=1024) | 0.0305 ms | 0.0299 ms | 0.98x |
-| LayerNorm (B=1024 N=1024) | 0.0372 ms | 0.1090 ms | 2.93x |
-| GEMM (1024^3) | 2.7968 ms | 0.3458 ms (cuBLAS) | 0.12x |
-| GEMM mma fp16 (1024^3) | 0.542 ms | 0.237 ms (cuBLAS fp16) | 0.44x |
-| GEMM mma fp16 (2048^3) | 3.889 ms | 0.867 ms (cuBLAS fp16) | 0.22x |
-| GEMM mma fp16 (4096^3) | 26.532 ms | 6.542 ms (cuBLAS fp16) | 0.25x |
-| FlashAttention v3 (N=8192 D=64) | full 16.7522 / causal 8.8380 ms | - | causal 提速 1.90x |
-| FlashAttention v4 (N=129 D=64, fp16) | full 0.0267 / causal 0.0611 ms | - | 短序列固定开销主导 |
-| FlashAttention v5 (N=129 D=64, fp16) | full 0.0221 / causal 0.0198 ms | - | P fragment 寄存器直连 |
+| RMSNorm fp32 `[1024,1024]` | 0.0308 ms | `F.rms_norm` 0.1113 ms | **3.61x** |
+| Softmax fp32 `[1024,1024]` | 0.0298 ms | `torch.softmax` 0.0296 ms | 0.99x |
+| LayerNorm fp32 `[1024,1024]`（无 affine） | 0.0294 ms | `F.layer_norm` 0.0342 ms | 1.16x |
+| GEMM fp32 `1024³`（TF32 off） | 2.4011 ms / 0.89 TFLOP/s | cuBLAS 0.2971 ms / 7.23 TFLOP/s | 0.12x |
+| GEMM MMA fp16 `1024³`，fp32 输出 | 0.3662 ms / 5.86 TFLOP/s | cuBLAS 0.1551 ms / 13.84 TFLOP/s | 0.42x |
+| GEMM MMA fp16 `2048³`，fp32 输出 | 2.9444 ms / 5.83 TFLOP/s | cuBLAS 0.7453 ms / 23.05 TFLOP/s | 0.25x |
+| GEMM MMA fp16 `4096³`，fp32 输出 | 23.6924 ms / 5.80 TFLOP/s | cuBLAS 6.1038 ms / 22.52 TFLOP/s | 0.26x |
+| FlashAttention v5 D=64 | 0.4025 ms | PyTorch SDPA 0.1272 ms | 0.32x |
+| FlashAttention v6 D=128 | 0.8789 ms | PyTorch SDPA 0.2388 ms | 0.27x |
 
-### 2026-09-10 实机验证记录
+测速固定使用 CUDA Event、20 次预热、每组 100 次迭代、交错 7 轮取中位数。正确性测试与性能测试分离：`test_all.py` 不再输出性能结论。GEMM MMA 的两侧都使用 fp16 输入、fp32 累加和 fp32 输出；这是关键约束，因为直接比较 `torch.matmul(fp16)` 会得到 fp16 输出，数值语义和写回带宽都不一致。
 
-本次在 RTX 3060 Laptop（sm_86，6GB）上重新编译并运行 `test_all.py`。PyTorch 为 `2.6.0+cu124`，CUDA Toolkit 为 `12.4`。系统没有 `nvidia-smi`，但 PyTorch 成功识别 GPU：`torch.cuda.is_available() == True`、`device_count == 1`。
+### GEMM MMA 的 NCU 基线
+
+对 `1024³` 的 `gemm_mma` 抓取一次 NCU basic profile：
+
+```bash
+/usr/local/cuda/bin/ncu --set basic \
+  --kernel-name 'regex:gemm_mma' --launch-count 1 \
+  ~/venvs/torch/bin/python bench_ops.py --warmup 1 --iters 1 --rounds 1
+```
+
+| 指标 | 当前值 |
+|---|---:|
+| Registers/thread | 56 |
+| Static shared memory/block | 4.10 KB |
+| Theoretical / achieved occupancy | 66.67% / 57.40% |
+| Compute throughput | 50.63% |
+| Memory / L1-TEX / DRAM throughput | 66.17% / 70.78% / 6.13% |
+
+高 L1/TEX、低 DRAM 表明问题不只是显存带宽，更可能在 on-chip 数据通路、shared-memory fragment load、同步和流水重叠。寄存器把理论 occupancy 限制在 66.67%，但并未低到能单独解释约 4 倍的 cuBLAS 差距。因此下一版应做受控实验：先只加入 `cp.async` 双缓冲，再单独引入 `ldmatrix`/更大 warp tile，每一步都跑 correctness、统一 benchmark 和同一组 NCU 指标。NCU 的多 pass `Duration` 含 replay 影响，不应替代上方 CUDA Event 性能数据。
+
+### 2026-09-11 实机验证记录
+
+本次在 RTX 3060 Laptop（sm_86，6GB）上重新编译并运行 `test_all.py`。PyTorch 为 `2.6.0+cu124`，CUDA Toolkit 为 `12.4`。WSL 的 `/usr/lib/wsl/lib` 已加入 `PATH`，`nvidia-smi` 与 PyTorch 均可识别 GPU：`torch.cuda.is_available() == True`、`device_count == 1`。
 
 运行命令：
 
@@ -78,6 +102,8 @@ export TORCH_CUDA_ARCH_LIST="8.6"
 [FlashAttention v4 causal] PASS  maxErr=9.766e-04
 [FlashAttention v5 full] PASS  maxErr=4.883e-04
 [FlashAttention v5 causal] PASS  maxErr=9.766e-04
+[FlashAttention v6 D128 full] PASS  maxErr=4.883e-04
+[FlashAttention v6 D128 causal] PASS  maxErr=2.441e-04
 ```
 
 v4/v5 测试使用 `N=129`，专门覆盖不是 64 倍数的 K/V 尾块，同时验证 full 和 causal 两种模式。两版输出为 fp16，reference 使用 fp16 输入、fp32 计算后再转回 fp16，误差阈值为 `2e-2`。v4/v5 的误差逐项完全相同，说明 v5 只改变 P 的搬运路径，没有改变数值语义。
@@ -107,6 +133,39 @@ O += sequence_offset;
 | causal | 0.4613 ms | 2.3670 ms | 0.1955 ms | **5.13x** |
 
 二维 grid 消除了 16 次 Python/C++/CUDA launch 的串行提交开销，并把全部 head 的 Q block 一次性暴露给 GPU 调度器。与工业级 SDPA 仍有约 2.4–3.4x 差距，后续方向是支持更多 head dimension、减少手写 fragment load 指令并研究异步流水，而不是把该结果包装成“超过 PyTorch”。可用 `python bench_flashattention_bhd.py` 复现。
+
+### v6：D=128 扩展实验
+
+v5 的 D=64 不是把宏改成 128 就结束。D 同时影响三条路径：QK 的归约步数从 `64/16=4` 变成 `128/16=8`；Q/K/V shared-memory 行宽从 65 变成 129；PV 的输出 tile 数从 `64/8=8` 变成 `128/8=16`，于是每个线程的 `o_acc` 也翻倍。v6 保留 register-P 重排，只扩展这些维度。
+
+正确性测试使用连续 `[B,H,N,D]=[2,2,65,128]`，full/causal 均与 SDPA 对齐。性能脚本为 [bench_flashattention_d128.py](bench_flashattention_d128.py)，同一输入、交错 5 轮中位数：
+
+| N | 模式 | v6 D=128 | PyTorch SDPA | v6/SDPA |
+|---:|---|---:|---:|---:|
+| 1024 | full | 0.8180 ms | 0.2513 ms | 3.25x |
+| 1024 | causal | 0.3210 ms | 0.1005 ms | 3.20x |
+| 4096 | full | 7.3629 ms | 1.8643 ms | 3.95x |
+| 4096 | causal | 3.5975 ms | 1.0083 ms | 3.57x |
+
+ptxas/NCU 资源结果：
+
+```bash
+/usr/local/cuda/bin/ncu --set basic \
+  --target-processes all \
+  --kernel-name 'regex:flash_fp16_mma_v6' \
+  --launch-count 1 \
+  ~/venvs/torch/bin/python bench_flashattention_d128.py --n 1024 --warmup 1 --iters 1 --rounds 1
+```
+
+| 资源 | v6 full | v6 causal |
+|---|---:|---:|
+| Registers/thread | 128 | 163 |
+| Static shared memory/block | 49.54 KB | 49.54 KB |
+| Theoretical occupancy | 16.67% | 16.67% |
+| Achieved occupancy（NCU full） | 15.98% | - |
+| Spill stores/loads | 0 / 0 | 0 / 0 |
+
+原因是 shared memory 已经限制每 SM 只能放 2 个 block；causal 的 163 registers/thread 又显著压缩了寄存器余量。v6 当前定位是“正确的 D=128 结构原型”，下一次优化应围绕减小 `o_acc` 生命周期、降低 PV 输出 tile 的寄存器占用，或重新设计 `Bq`，而不是盲目继续加 unroll。
 
 ### 长序列性能：v3 vs v4 vs v5
 
@@ -176,17 +235,17 @@ v4 的路径是 `S(fp32 registers) → fp16 Ps(smem) → half2 A registers → M
 
 ### 为什么是这个结果
 
-- **归一化类（RMSNorm/LayerNorm）」融合是最大卖点**：PyTorch 原生把它拆成 pow→mean→rsqrt→mul 多个 kernel，中间结果反复写回显存；fused 一次加载一次写回，3-5x。
+- **归一化类必须与融合后的原生算子比较**：RMSNorm 对比 `F.rms_norm` 为 3.61x；LayerNorm 对比 `F.layer_norm` 只有 1.16x。旧的手写 eager 表达式会启动多个 kernel，不能代表 PyTorch 原生 LayerNorm。
 - **Softmax 0.97x 不丢人**：B=N=1024 时 torch.softmax 本身已是单个融合 kernel，打平合理；换非 2 的幂 N 或更大 batch，线程粗化版通常反超。
 - **GEMM 0.12x 是诚实的差距展示**：v2 tiled 手写 vs cuBLAS 差 9 倍——cuBLAS 用 Tensor Core + 深度流水线。这正是路线 B（FP16 + mma.sync）的动机，也是"知道轮子多快"和"会造轮子"都要会的证据。
-- **gemm_mma 0.22x-0.44x 是路线 B 的第一步**：手写 `mma.sync.m16n8k16` 后，1024³ 从 v2 fp32 的 ~700 GFLOPS 跃升到 3963 GFLOPS（~6x），大尺寸到 5.2 TFLOPS；与 cuBLAS fp16 差距从 ~13x 缩到 2-4x。剩余差距来自无 cp.async 双缓冲 / ldmatrix / 大 tile，是"追平 cuBLAS"的后续迭代点。注：cuBLAS 对比走 `torch.matmul` 的 fp16 累加路径（比 fp32 累加更快），手写版是 fp32 累加，严格同精度对比见 kernels/gemm_v4_mma.cu 的 cublasGemmEx。
+- **gemm_mma 0.25x-0.42x 是路线 B 的第一步**：手写 `mma.sync.m16n8k16` 达到约 5.8 TFLOP/s；新增的 cuBLAS wrapper 在相同 fp16 输入、fp32 累加、fp32 输出下达到 13.8-23.1 TFLOP/s。剩余差距需要用 NCU 验证，优先假设是同步搬运、缺少 `cp.async` 双缓冲、标量 fragment load 和 tile 太小，不能先把猜测写成结论。
 
 ## 文件结构
 
 ```
 torch_ext/
 ├── csrc/
-│   ├── bindings.cpp           # PyBind11 绑定：统一暴露 8 个 forward
+│   ├── bindings.cpp           # PyBind11 绑定：9 个手写算子 + 1 个 cuBLAS 基线
 │   ├── ops.h                  # 入口函数声明
 │   ├── rmsnorm_cuda.cu        # 各算子：CUDA kernel + torch::Tensor 包装
 │   ├── softmax_cuda.cu
@@ -194,11 +253,15 @@ torch_ext/
 │   ├── gemm_cuda.cu
 │   ├── flashattention_cuda.cu       # FlashAttention v3，fp32 baseline
 │   ├── flashattention_mma_cuda.cu  # FlashAttention v4，fp16 Tensor Core + Ps
-│   └── flashattention_v5_cuda.cu   # FlashAttention v5，P fragment 寄存器直连
+│   ├── flashattention_v5_cuda.cu   # FlashAttention v5，P fragment 寄存器直连
+│   └── flashattention_v6_cuda.cu   # FlashAttention v6，D=128 实验版
 ├── setup.py                   # CUDAExtension 单模块构建
-├── test_all.py                # 全量正确性对拍 + 基础 benchmark
+├── test_all.py                # 全量正确性、边界与 CUDA stream 契约测试
+├── bench_ops.py               # 统一同语义 benchmark（CUDA Event/交错/中位数）
+├── bench_avg.py               # 兼容旧入口，转到 bench_ops.py
 ├── bench_flashattention.py    # v3/v4/v5 交错、轮换顺序 benchmark
-└── bench_flashattention_bhd.py # v5 BHD vs 逐 head dispatch vs PyTorch SDPA
+├── bench_flashattention_bhd.py # v5 BHD vs 逐 head dispatch vs PyTorch SDPA
+└── bench_flashattention_d128.py # v6 D=128 vs PyTorch SDPA
 ```
 
 ## 关键点（面试常问）

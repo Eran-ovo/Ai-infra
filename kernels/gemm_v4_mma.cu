@@ -141,14 +141,15 @@ __global__ void gemm_mma(const __half* __restrict__ A,
         // c0 = (g, gid*2), c1 = (g, gid*2+1), c2 = (g+8, gid*2), c3 = (g+8, gid*2+1)
         int r0 = mr + g, c0 = nc + gid * 2;
         int r2 = mr + g + 8;
-        if (r0 < M && c0 + 1 < N) {
-            C[r0 * N + c0]     = acc[t][0];
+        // 一个 lane 持有相邻两列；尾 tile 可能只剩一列，因此逐元素判断。
+        if (r0 < M && c0 < N)
+            C[r0 * N + c0] = acc[t][0];
+        if (r0 < M && c0 + 1 < N)
             C[r0 * N + c0 + 1] = acc[t][1];
-        }
-        if (r2 < M && c0 + 1 < N) {
-            C[r2 * N + c0]     = acc[t][2];
+        if (r2 < M && c0 < N)
+            C[r2 * N + c0] = acc[t][2];
+        if (r2 < M && c0 + 1 < N)
             C[r2 * N + c0 + 1] = acc[t][3];
-        }
     }
 }
 

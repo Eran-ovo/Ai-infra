@@ -23,7 +23,7 @@
 
   <div class="hero">
     <h1>FlashAttention：分块 + Online Softmax</h1>
-    <p class="sub">五个版本复现 FA2：v1 分块 + online softmax → v2 causal → v3 warp-per-row → v4 fp16 Tensor Core → v5 P fragment 寄存器直连。核心主张始终是「让 S 矩阵永不落地 HBM」。</p>
+    <p class="sub">六个版本复现 FA2：v1 分块 + online softmax → v2 causal → v3 warp-per-row → v4 fp16 Tensor Core → v5 P fragment 寄存器直连 → v6 D=128。核心主张始终是「让 S 矩阵永不落地 HBM」。</p>
   </div>
 
   <h2>一、先看标准 attention 哪里"贵"</h2>
@@ -219,7 +219,18 @@ pa3 = half2(S[st + 1][2], S[st + 1][3]);  // row g+8, cols 8..15</pre>
     <div class="tip"><b>关键认识</b>：fragment 不是只能“从 shared memory 加载”的黑盒。只要证明生产者的 C-fragment 布局与消费者的 A-fragment 布局之间的映射，就可以直接在寄存器中重排，消除中间存储。</div>
   </div>
 
-  <h2>四、五版区别总览</h2>
+  <div class="op">
+    <div class="op-head">
+      <span class="op-title">v6 · D=128 扩展实验</span>
+      <span class="op-file">kernels/flashattention_v6.cu</span>
+      <span class="op-perf">B=2,H=2,N=4096 full 7.3629 ms</span>
+    </div>
+    <p><strong>不是改一个宏</strong>：D=128 让 QK 的 reduction step 从 4 变成 8，Q/K/V shared-memory 行宽从 65 变成 129，PV 输出 tile 从 8 变成 16。v6 保留 v5 的 register-P 映射，因此 P 仍然不经过 shared memory。</p>
+    <p><strong>资源代价</strong>：static shared memory 49.54 KB，full/causal 分别使用 128/163 registers per thread，理论 occupancy 为 16.67%，但无 spill。causal 路径的高寄存器压力说明下一步应研究 accumulator 生命周期、Bq 重新分块或 tile 设计。</p>
+    <div class="tip"><b>学习重点</b>：head dimension 是 kernel 设计参数，不是普通 shape 参数。它同时改变算术工作量、shared-memory 容量、寄存器文件占用和 occupancy，必须用 ptxas + NCU + benchmark 一起判断。</div>
+  </div>
+
+  <h2>四、六版区别总览</h2>
   <table>
     <tr><th>版本</th><th>线程映射</th><th>精度</th><th>causal</th><th>核心增量</th></tr>
     <tr><td>v1</td><td>一线程一行</td><td>fp32</td><td>否</td><td>分块 + online softmax（S 不落 HBM）</td></tr>
@@ -227,9 +238,10 @@ pa3 = half2(S[st + 1][2], S[st + 1][3]);  // row g+8, cols 8..15</pre>
     <tr><td>v3</td><td>一 warp 一行</td><td>fp32</td><td>✔</td><td>warp-per-row 寄存器瘦身 + padding 消 bank conflict</td></tr>
     <tr><td>v4</td><td>一 warp 16 行</td><td>fp16 / fp32 累加</td><td>✔ 模板双模式</td><td>手写 mma.sync + K/V tail mask + causal mask</td></tr>
     <tr><td>v5</td><td>一 warp 16 行</td><td>fp16 / fp32 累加</td><td>✔ 模板双模式</td><td>QK 的 C fragment 直连 PV 的 A fragment，删除 Ps</td></tr>
+    <tr><td>v6</td><td>一 warp 16 行</td><td>fp16 / fp32 累加</td><td>✔ 模板双模式</td><td>D=128：8 个 QK reduction step + 16 个 PV output tile</td></tr>
   </table>
 
-  <div class="note"><b>一句话主线</b>：v1 奠定"分块 + online softmax"的正确性骨架；v2 补 causal 并踩出 occupancy 的教训；v3 用 warp-per-row 重划分工作；v4 把两个 GEMM 换成 Tensor Core并以 Ps 建立清晰基线；v5 再利用 fragment 布局删除 Ps 中转——形成一次完整、可归因的性能优化实验。</div>
+  <div class="note"><b>一句话主线</b>：v1 奠定"分块 + online softmax"的正确性骨架；v2 补 causal 并踩出 occupancy 的教训；v3 用 warp-per-row 重划分工作；v4 把两个 GEMM 换成 Tensor Core并以 Ps 建立清晰基线；v5 删除 Ps 中转；v6 证明 D=128 会重新引入片上容量和寄存器瓶颈。</div>
 
   <div class="footer">
     <span>cuda-kernels · FlashAttention 类</span>
