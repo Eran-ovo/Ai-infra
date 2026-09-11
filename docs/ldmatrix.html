@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ldmatrix 与 Bank Conflict 可视化 | cuda-kernels</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <span class="brand">cuda-kernels 文档</span>
+  <nav>
+    <a href="index.html">总览</a>
+    <a href="gemm.html">GEMM</a>
+    <a href="ldmatrix.html" class="active">ldmatrix 演示</a>
+    <a href="normalization.html">归约 / 归一化</a>
+    <a href="flashattention.html">FlashAttention</a>
+    <a href="torch_ext.html">PyTorch 封装</a>
+  </nav>
+</header>
+
+<div class="wrap">
+  <div class="hero">
+    <h1>把 ldmatrix 和 bank conflict 真的“看见”</h1>
+    <p class="sub">GEMM v7 → v8 交互演示：32 个 lane 如何协作装载，以及 +8 half padding 为什么能把 LDSM bank conflict 降为 0。</p>
+  </div>
+
+  <div class="key-answer"><b>先记住一句话：</b><code>ldmatrix</code> 负责 shared memory → 寄存器；padding 负责让 8 个行读取请求落到不同 bank。它们解决的是两个不同问题。</div>
+
+  <h2>一、一块数据到底经过哪里？</h2>
+  <div class="flow-strip">
+    <div class="flow-stage"><strong>Global memory</strong><small>A、B 原始矩阵</small></div>
+    <div class="flow-stage"><strong>16-byte copy</strong><small><code>uint4</code> / <code>cp.async</code></small></div>
+    <div class="flow-stage"><strong>Shared memory</strong><small>一个 block 内复用</small></div>
+    <div class="flow-stage key"><strong><code>ldmatrix</code></strong><small>32 lanes → fragment</small></div>
+    <div class="flow-stage"><strong><code>mma.sync</code></strong><small>Tensor Core → FP32 累加</small></div>
+  </div>
+  <p><code>ldmatrix</code> 不做乘法，也不从 global memory 取数。它只接管以前“每个 lane 手工读取 <code>half2</code>”的 shared → register 这一段。</p>
+
+  <h2>二、互动：为什么 v7 冲突，v8 不冲突？</h2>
+  <p>每行读取连续 8 个 <code>half</code>，共 16 bytes，即连续 4 个 bank。切换 A/B 和 v7/v8，再观察 8 行分别点亮哪些 bank。</p>
+
+  <div class="demo-panel">
+    <div class="demo-toolbar" aria-label="Bank map 控制器">
+      <button class="demo-btn active" type="button" data-matrix="A">矩阵 A</button>
+      <button class="demo-btn" type="button" data-matrix="B">矩阵 B</button>
+      <span aria-hidden="true">·</span>
+      <button class="demo-btn active" type="button" data-version="v7">v7 无 padding</button>
+      <button class="demo-btn" type="button" data-version="v8">v8 +8 half</button>
+      <span class="spacer"></span>
+      <button class="demo-btn" id="play-banks" type="button">逐行播放</button>
+      <button class="demo-btn" id="show-all-banks" type="button">显示全部</button>
+    </div>
+
+    <div class="bank-summary">
+      <div class="bank-stat"><span>物理行跨度</span><strong id="stride-value"></strong></div>
+      <div class="bank-stat"><span>下一行前进</span><strong id="step-value"></strong></div>
+      <div class="bank-stat"><span>8 个行首 bank</span><strong id="starts-value"></strong></div>
+    </div>
+
+    <div class="bank-scroll"><div class="bank-map" id="bank-map" aria-live="polite"></div></div>
+    <div class="demo-status" id="bank-status"></div>
+  </div>
+
+  <pre>bank = floor(byte_address / 4) mod 32
+row_start_bank = (row × stride_bytes / 4) mod 32</pre>
+  <div class="definition"><b>怎么看图：</b>绿色表示这一 bank 只被一行命中；红色表示多个行请求在同一次 warp cooperative load 中命中了同一 bank，硬件需要把请求分批服务。</div>
+
+  <h3>A 和 B 的 stride 为什么不同？</h3>
+  <table>
+    <tr><th>对象</th><th>v7 stride</th><th>v7 行首</th><th>v8 stride</th><th>v8 行首</th></tr>
+    <tr><td>A</td><td>16 half = 8 banks</td><td><code>0,8,16,24</code> 重复</td><td>24 half = 12 banks</td><td><code>0,12,24,4,16,28,8,20</code></td></tr>
+    <tr><td>B</td><td>64 half = 32 banks</td><td>永远是 <code>0</code></td><td>72 half = 36 ≡ 4 banks</td><td><code>0,4,8,…,28</code></td></tr>
+  </table>
+
+  <h2>三、互动：<code>m8n8.x4</code> 的 “x4” 是什么？</h2>
+  <p>A 的逻辑 fragment 是 <code>16×16</code>。<code>ldmatrix.m8n8.x4</code> 把它看成四块 <code>8×8</code>。点击四个 fragment，看哪 8 个 lane 提供该子矩阵的行首地址。</p>
+
+  <div class="demo-panel fragment-demo">
+    <div><div class="fragment-grid" id="fragment-grid" aria-label="A 的 16 乘 16 fragment"></div></div>
+    <div>
+      <div class="demo-toolbar" aria-label="Fragment 选择器">
+        <button class="demo-btn active" type="button" data-quadrant="0">a0 左上</button>
+        <button class="demo-btn" type="button" data-quadrant="1">a1 左下</button>
+        <button class="demo-btn" type="button" data-quadrant="2">a2 右上</button>
+        <button class="demo-btn" type="button" data-quadrant="3">a3 右下</button>
+      </div>
+      <h3 id="quadrant-title"></h3>
+      <p id="quadrant-copy"></p>
+      <div class="lane-grid" id="lane-grid" aria-label="Warp 的 32 个 lane"></div>
+      <div class="key-answer"><b>最容易误解的地方：</b>高亮 lane 只是“提供地址”的 lane。指令完成后，不是只有这 8 个 lane 拿到数据，而是所有 32 个 lane 都拿到各自的 <code>r0..r3</code> 片段。</div>
+      <p>每个 lane 的指令输出：</p>
+      <div class="register-result"><code>r0 / a0</code><code>r1 / a1</code><code>r2 / a2</code><code>r3 / a3</code></div>
+    </div>
+  </div>
+
+  <pre>matrix 0: rows  0..7, cols 0..7   → a0
+matrix 1: rows 8..15, cols 0..7   → a1
+matrix 2: rows  0..7, cols 8..15  → a2
+matrix 3: rows 8..15, cols 8..15  → a3</pre>
+
+  <h2>四、B 为什么使用 <code>.x2.trans</code>？</h2>
+  <div class="concept-grid">
+    <div class="concept-card">
+      <h3><code>.x2</code></h3>
+      <p>一次读取两个 <code>8×8</code> fp16 子矩阵，合起来覆盖 MMA 需要的 <code>16×8</code> B fragment。</p>
+    </div>
+    <div class="concept-card">
+      <h3><code>.trans</code></h3>
+      <p>shared 中仍按便于搬运的行方向存储；装载时转成 <code>mma.sync.m16n8k16.row.col</code> 所需的列主序寄存器布局。</p>
+    </div>
+    <div class="concept-card">
+      <h3><code>.aligned</code></h3>
+      <p>所有 32 个 lane 必须共同执行，并提供符合规范的对齐地址，不能只让分支中的部分 lane 调用。</p>
+    </div>
+  </div>
+
+  <h2>五、padding 改了矩阵吗？</h2>
+  <p>没有。padding 只在 shared memory 每行末尾加不用的空格，改变下一行从哪个 bank 开始；逻辑坐标和数值都不变。</p>
+  <pre>// 逻辑数据仍然只有 BK 或 BN 个 half
+A v7: [16 个有效 half]                         stride = 16
+A v8: [16 个有效 half][8 个不用的 padding]     stride = 24
+
+B v7: [64 个有效 half]                         stride = 64
+B v8: [64 个有效 half][8 个不用的 padding]     stride = 72</pre>
+  <p>多出的 8 个 <code>half</code> 是 16 bytes，所以新 stride 仍满足 <code>uint4</code> 和 <code>ldmatrix.aligned</code> 的 16-byte 对齐要求。</p>
+
+  <h2>六、把动画对应回 NCU</h2>
+  <table>
+    <tr><th>4096³</th><th>v7 ldmatrix</th><th>v8 + padding</th><th>变化</th></tr>
+    <tr><td>LDSM bank conflict</td><td>503,316,480</td><td class="good">0</td><td>冲突消失</td></tr>
+    <tr><td>运行时间</td><td>18.0124 ms</td><td class="good">11.0606 ms</td><td>1.63×</td></tr>
+    <tr><td>性能</td><td>7.63 TFLOP/s</td><td class="good">12.43 TFLOP/s</td><td>+63%</td></tr>
+  </table>
+  <div class="key-answer"><b>完整因果链：</b>padding → 行首 bank 错开 → LDSM 不再分批执行 → shared→register 延迟下降 → GEMM 加速。</div>
+
+  <h2>七、v9 为什么还要组合 <code>cp.async</code>？</h2>
+  <p><code>cp.async</code> 与 <code>ldmatrix</code> 不重复：前者优化 global→shared，后者优化 shared→register。v9 试图让“搬下一块”和“算当前块”重叠，同时保留 v8 的无冲突装载。</p>
+  <pre>时间 →
+stage 0: [cp.async tile 0] [ldmatrix 0 + mma 0]
+stage 1:                   [cp.async tile 1] [ldmatrix 1 + mma 1]
+                                   ↑ 理想情况下重叠 ↑</pre>
+  <p>但双缓冲会增加 shared memory 和寄存器生命周期，所以最终是否更快仍要看 NCU，不能只看代码里是否用了更多“高级指令”。</p>
+
+  <div class="demo-callout">
+    <p><strong>结合源码看：</strong><code>ldmatrix_x4</code>、<code>ldmatrix_x2_trans</code> 和 <code>AS_STRIDE / BS_STRIDE</code> 都在同一个实现里。</p>
+    <a class="demo-link" href="../torch_ext/csrc/gemm_mma_cuda.cu">打开源码</a>
+  </div>
+
+  <div class="footer">
+    <span>cuda-kernels · ldmatrix 可视化</span>
+    <span><a href="gemm.html">← 返回 GEMM</a> · <a href="index.html">返回总览</a></span>
+  </div>
+</div>
+
+<script>
+(() => {
+  const state = { matrix: 'A', version: 'v7', visibleRows: 8, timer: null, quadrant: 0 };
+  const strides = { A: { v7: 16, v8: 24 }, B: { v7: 64, v8: 72 } };
+  const bankMap = document.querySelector('#bank-map');
+
+  function stopPlayback() {
+    if (state.timer !== null) window.clearInterval(state.timer);
+    state.timer = null;
+    document.querySelector('#play-banks').textContent = '逐行播放';
+  }
+
+  function getBankData() {
+    const strideHalf = strides[state.matrix][state.version];
+    const strideBytes = strideHalf * 2;
+    const step = (strideBytes / 4) % 32;
+    const starts = Array.from({ length: 8 }, (_, row) => (row * step) % 32);
+    const hits = starts.map(start => Array.from({ length: 4 }, (_, offset) => (start + offset) % 32));
+    const counts = Array(32).fill(0);
+    hits.forEach(row => row.forEach(bank => { counts[bank] += 1; }));
+    return { strideHalf, strideBytes, step, starts, hits, counts };
+  }
+
+  function makeBankCell(bank, className = '') {
+    const cell = document.createElement('span');
+    cell.className = `bank-cell ${className}`.trim();
+    cell.textContent = bank;
+    return cell;
+  }
+
+  function renderBanks() {
+    const data = getBankData();
+    document.querySelector('#stride-value').textContent = `${data.strideHalf} half = ${data.strideBytes} B`;
+    document.querySelector('#step-value').textContent = `${data.step} banks (mod 32)`;
+    document.querySelector('#starts-value').textContent = data.starts.join(', ');
+    bankMap.replaceChildren();
+
+    const header = document.createElement('div');
+    header.className = 'bank-row bank-head';
+    const headerLabel = document.createElement('span');
+    headerLabel.className = 'bank-label';
+    headerLabel.textContent = 'bank 编号';
+    header.appendChild(headerLabel);
+    for (let bank = 0; bank < 32; bank += 1) header.appendChild(makeBankCell(bank));
+    bankMap.appendChild(header);
+
+    data.hits.forEach((rowHits, row) => {
+      const line = document.createElement('div');
+      const pending = row >= state.visibleRows;
+      const current = state.visibleRows < 8 && row === state.visibleRows - 1;
+      line.className = `bank-row${pending ? ' pending' : ''}${current ? ' current' : ''}`;
+      const label = document.createElement('span');
+      label.className = 'bank-label';
+      label.textContent = `row ${row} → ${data.starts[row]}`;
+      line.appendChild(label);
+      for (let bank = 0; bank < 32; bank += 1) {
+        const hit = rowHits.includes(bank);
+        const cellClass = hit ? `hit ${data.counts[bank] > 1 ? 'conflict' : 'clear'}` : '';
+        line.appendChild(makeBankCell(bank, cellClass));
+      }
+      bankMap.appendChild(line);
+    });
+
+    const conflictCount = data.counts.filter(count => count > 1).length;
+    const status = document.querySelector('#bank-status');
+    if (conflictCount > 0) {
+      status.className = 'demo-status bad';
+      status.innerHTML = `<strong>发生重叠：</strong>32 个 bank 中有 ${conflictCount} 个被多行同时命中。这里展示的是地址模式；NCU 的 503,316,480 是整个 kernel 期间累计的硬件计数。`;
+    } else {
+      status.className = 'demo-status good';
+      status.innerHTML = '<strong>没有重叠：</strong>8 行 × 每行 4 banks = 32 banks，恰好把所有 bank 各覆盖一次。';
+    }
+
+    document.querySelectorAll('[data-matrix]').forEach(button => button.classList.toggle('active', button.dataset.matrix === state.matrix));
+    document.querySelectorAll('[data-version]').forEach(button => button.classList.toggle('active', button.dataset.version === state.version));
+  }
+
+  document.querySelectorAll('[data-matrix]').forEach(button => {
+    button.addEventListener('click', () => {
+      stopPlayback(); state.matrix = button.dataset.matrix; state.visibleRows = 8; renderBanks();
+    });
+  });
+  document.querySelectorAll('[data-version]').forEach(button => {
+    button.addEventListener('click', () => {
+      stopPlayback(); state.version = button.dataset.version; state.visibleRows = 8; renderBanks();
+    });
+  });
+  document.querySelector('#play-banks').addEventListener('click', () => {
+    stopPlayback(); state.visibleRows = 0; renderBanks();
+    document.querySelector('#play-banks').textContent = '播放中…';
+    state.timer = window.setInterval(() => {
+      state.visibleRows += 1; renderBanks();
+      if (state.visibleRows >= 8) stopPlayback();
+    }, 430);
+  });
+  document.querySelector('#show-all-banks').addEventListener('click', () => {
+    stopPlayback(); state.visibleRows = 8; renderBanks();
+  });
+
+  const quadrants = [
+    { name: 'a0', rows: '0..7', cols: '0..7', lanes: '0..7' },
+    { name: 'a1', rows: '8..15', cols: '0..7', lanes: '8..15' },
+    { name: 'a2', rows: '0..7', cols: '8..15', lanes: '16..23' },
+    { name: 'a3', rows: '8..15', cols: '8..15', lanes: '24..31' }
+  ];
+  const quadrantFor = (row, col) => (row >= 8 ? 1 : 0) + (col >= 8 ? 2 : 0);
+
+  function renderFragment() {
+    const grid = document.querySelector('#fragment-grid');
+    const laneGrid = document.querySelector('#lane-grid');
+    const current = quadrants[state.quadrant];
+    grid.replaceChildren(); laneGrid.replaceChildren();
+    for (let row = 0; row < 16; row += 1) {
+      for (let col = 0; col < 16; col += 1) {
+        const quadrant = quadrantFor(row, col);
+        const cell = document.createElement('span');
+        cell.className = `fragment-cell q${quadrant} ${quadrant === state.quadrant ? 'focus' : 'dim'}`;
+        if (row % 8 === 3 && col % 8 === 3) cell.textContent = quadrants[quadrant].name;
+        grid.appendChild(cell);
+      }
+    }
+    for (let lane = 0; lane < 32; lane += 1) {
+      const cell = document.createElement('span');
+      cell.className = `lane-cell${Math.floor(lane / 8) === state.quadrant ? ' focus' : ''}`;
+      cell.textContent = lane;
+      laneGrid.appendChild(cell);
+    }
+    document.querySelector('#quadrant-title').textContent = `${current.name}：rows ${current.rows}，cols ${current.cols}`;
+    document.querySelector('#quadrant-copy').textContent = `lane ${current.lanes} 分别提供这 8 行的行首地址。`;
+    document.querySelectorAll('[data-quadrant]').forEach(button => button.classList.toggle('active', Number(button.dataset.quadrant) === state.quadrant));
+  }
+
+  document.querySelectorAll('[data-quadrant]').forEach(button => {
+    button.addEventListener('click', () => { state.quadrant = Number(button.dataset.quadrant); renderFragment(); });
+  });
+
+  renderBanks();
+  renderFragment();
+})();
+</script>
+</body>
+</html>

@@ -50,6 +50,14 @@
     </div>
 
     <div class="card">
+      <span class="kind">交互专题 · GEMM v7/v8</span>
+      <h3>ldmatrix 与 Bank Conflict</h3>
+      <p><strong>主线</strong>：把 32 个 lane 的协作装载、四个 8×8 fragment 和 32 个 shared-memory bank 直接画出来。</p>
+      <p><strong>可操作</strong>：切换 A/B、v7/v8，逐行播放 bank 映射，观察 padding 如何消除 LDSM 冲突。</p>
+      <a class="more" href="ldmatrix.html">打开交互演示 →</a>
+    </div>
+
+    <div class="card">
       <span class="kind">归约 · 3 版</span>
       <h3>归一化 / 归约</h3>
       <p><strong>主线</strong>：块内树形归约 + warp 内 shuffle 归约，一趟扫完 + 一次写回（fusion）。</p>

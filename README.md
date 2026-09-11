@@ -88,9 +88,9 @@ v3 把"一线程一行"改成"一 warp 一行"（FA2 的重划分思想），每
 
 **教训**：① occupancy、搬运量、算术强度是三角债，拉满一个可能拖累另一个，优化是找平衡点；② shared memory 列访问必查 bank conflict（步长是 32 倍数时全撞）；③ 发散分支里禁用跨 lane shuffle，会死锁。
 
-**GEMM v4 手写 Tensor Core（fp16 mma.sync）**（2026-09-08）：
+**GEMM v4-v8 手写 Tensor Core（`mma.sync` / `cp.async` / `ldmatrix`）**（2026-09-08/11）：
 
-v2 的 fp32 FMA 版在 1024³ 是 789 GFLOPS；v4 换成手写 `mma.sync.aligned.m16n8k16.row.col` 后，当前统一 benchmark 在 1024³/2048³/4096³ 上稳定在约 5.8 TFLOP/s。相同 fp16 输入、fp32 累加、fp32 输出的 cuBLAS 基线为 13.8–23.1 TFLOP/s，因此手写版达到 cuBLAS 的约 25%–42%。核心差异：FMA 是「每周期 32 个 lane 各 1 次乘加」，mma 是「每条指令整个 warp 算完 16×8×16=2048 次乘加」。
+v2 的 fp32 FMA 版在 1024³ 是 789 GFLOPS；v4 换成手写 `mma.sync.aligned.m16n8k16.row.col` 后约 5.5–5.8 TFLOP/s。继续加入 16-byte 对齐 fast path 和 `cp.async` 双缓冲后，v6 达到约 8.3–8.9 TFLOP/s，相对 v4 提升 1.49–1.59x。相同 fp16 输入、fp32 累加、fp32 输出的 cuBLAS 为 12.6–22.0 TFLOP/s。核心差异：FMA 是「每周期 32 个 lane 各 1 次乘加」，mma 是「每条指令整个 warp 算完 16×8×16=2048 次乘加」。
 
 **数据流**：`global fp16 A/B → smem tile → fragment(寄存器) → mma.sync → fp32 acc → global C`。为什么要先过 smem：fragment 布局是「乱序」的（每个 lane 读 `(g, 2*gid)` 这种跳变位置），直接从 global 读会打散合并访存；先用 256 线程按 `tid, tid+256...` 顺序接力搬进 smem（coalesced），再从 smem 按 fragment 布局自由索引（bank 带宽高、代价小）。
 
@@ -104,9 +104,11 @@ v2 的 fp32 FMA 版在 1024³ 是 789 GFLOPS；v4 换成手写 `mma.sync.aligned
 
 **踩坑**：A fragment 的 a1/a2 行索引写反 → **rows 16-63 输出全 0、前 16 行正确**（后 8 行 A 被当前 8 行用，矩阵错位）——**前 16 行对、后 48 行错的不均匀错位（而非全错）是 fragment 映射 bug 的标志**。定位手法：单 block + A=单位阵 + B=行号的确定性用例，一列 dump 出错误模式，一眼定位是哪半块错位。另：CPU 对拍必须和 GPU 吃**同一份 fp16 量化后的输入**（否则 0.2/0.4 这类无法精确表示的值会让两边基准不同、误报 FAIL），阈值用**相对误差**而非绝对误差（fp16 GEMM 的绝对误差随 K 线性增长）。
 
-**性能解释**：2048 比 1024 慢 **8 倍**是健康的线性扩展（工作量 2·M·N·K ∝ D³），判断标准看 **TFLOP/s 是否持平**。当前手写 MMA 在三个尺寸均约 5.8 TFLOP/s，说明扩展正常；cuBLAS 随尺寸从 13.8 升到约 23 TFLOP/s，则说明小尺寸尚未充分摊薄固定开销并填满硬件。若手写与 cuBLAS 在同一进程中同时按比例变慢，才更像笔记本 GPU 的频率/TDP 波动。
+**性能解释**：2048 比 1024 慢 **8 倍**是健康的线性扩展（工作量 2·M·N·K ∝ D³），判断标准看 **TFLOP/s 是否持平**。v6 在三个尺寸均约 8.3–8.9 TFLOP/s，说明扩展正常；cuBLAS 在大尺寸升至约 22 TFLOP/s，则说明小尺寸尚未充分摊薄固定开销并填满硬件。若手写与 cuBLAS 在同一进程中同时按比例变慢，才更像笔记本 GPU 的频率/TDP 波动。
 
-**测量口径差异（重要）**：首轮含 CUDA context、库初始化、冷缓存和未稳态频率，不能作为 kernel 稳态性能。统一脚本先预热，再用 CUDA Event 测当前 stream 上的 GPU 时间，交错 7 轮取中位数。尤其不能直接拿 `gemm_mma` 与 `torch.matmul(fp16)` 比：前者输出 fp32，后者输出 fp16。扩展中的 `gemm_cublas_fp32` 明确调用 `cublasGemmEx`，把输入、累加和输出语义完全对齐。
+v7 在相同 `64×64×16` tile 上把标量 fragment load 换成 warp 级 `ldmatrix`，但 `4096³` 仍约 18.01 ms。NCU 显示 5.03 亿次 LDSM bank conflict：A/B 原行跨度分别为 32/128 bytes，映射到 32 个 4-byte bank 后周期性重叠。v8 给每行增加 8 个 half，使跨度变成 48/144 bytes；8 行的 16-byte 段恰好落到互不重叠的 bank 区间。冲突降到 0，`4096³` 降至 11.06 ms（12.43 TFLOP/s），相对 v7 提速 1.63x、达到同轮同语义 cuBLAS 的约 66%。这里的关键不是“换了一条高级指令”，而是指令要求与 shared-memory layout 必须共同设计。
+
+**测量口径差异（重要）**：首轮含 CUDA context、库初始化、冷缓存和未稳态频率，不能作为 kernel 稳态性能。统一脚本先预热，再用 CUDA Event 测当前 stream 上的 GPU 时间，交错多轮取中位数；GEMM 版本链由 [`torch_ext/bench_gemm_mma.py`](torch_ext/bench_gemm_mma.py) 复现。尤其不能直接拿 `gemm_mma` 与 `torch.matmul(fp16)` 比：前者输出 fp32，后者输出 fp16。扩展中的 `gemm_cublas_fp32` 明确调用 `cublasGemmEx`，把输入、累加和输出语义完全对齐。
 
 **FlashAttention v5：删除 P 的 shared-memory 中转**（2026-09-10）：
 
@@ -128,7 +130,7 @@ v4 在 QK MMA 和 online softmax 后，把寄存器中的概率写入 `Ps[64][65
 - **gemm_v1**: Shared Memory 分块（TILE=32），`As[ty][k] * Bs[k][tx]` 的访问模式天然无 Bank Conflict（源码注释里附了冲突反例对比）。相对 v0 加速 ~1.3x。
 - **gemm_v2**: 在 v1 已合并访存的基础上，全局加载改用 `__ldg` 走只读缓存 + `__restrict__`。
 - **gemm_v3_cutlass**: 调用 NVIDIA CUTLASS 库的 `cutlass::gemm::device::Gemm`，编译期固化 tile/warp/流水线配置，几乎零运行时开销；相比手写 v2 提速 ~6.5x，展示了工业级库与手写 kernel 的差距。
-- **gemm_v4_mma**: 手写 Tensor Core GEMM——fp16 输入用 `mma.sync.aligned.m16n8k16.row.col` 内联 PTX 指令，绕开 wmma API 与 CUTLASS，亲手管理 fragment 布局 + smem 搬运 + 8-warp 分块。统一同语义 benchmark 约 5.8 TFLOP/s，达到 cuBLAS 的 25%–42%；后续用 NCU 验证 `cp.async` 双缓冲、`ldmatrix` 和更大 tile 的收益。踩坑见上方“GEMM v4 手写 Tensor Core”调优记录。
+- **gemm_v4-v8**: v4 手写 `mma.sync` 与 fragment；v5 增加对齐 16-byte 搬运 fast path；v6 使用 `cp.async` 双缓冲；v7 用 `ldmatrix` 暴露 shared-memory bank conflict；v8 通过 A/B 行 padding 将 LDSM 冲突从 5.03 亿降到 0。`4096³` 从 v4 的 26.88 ms 降至 v8 的 11.06 ms，形成“单变量修改—benchmark—NCU—layout 推导—再验证”的完整优化链。
 - **softmax_v1**: 数值安全版（减 max）fused softmax；线程粗化（grid-stride）预扫描 + block 内树形归约到 32 个线程后改用 `__shfl_down_sync` warp 内归约，避免 `__syncthreads` 开销。
 - **layernorm_v1**: 一行一 block，线程粗化加载，两次归约（sum → 均值，平方和 → 方差），`rsqrtf(var+eps)` 归一化。
 - **rmsnorm_v1**: LLaMA/Qwen 标配的 RMSNorm。相比 LayerNorm 去掉 centering（减均值），只需一次归约（Σx²），且省一次全局显存读写。

@@ -26,6 +26,11 @@
     <p class="sub">一类算子、五版迭代：v0 朴素 → v1 smem tiling → v2 ldg → v3 CUTLASS → v4 手写 mma.sync。目标 M=N=K=1024，RTX 3060 Laptop 实测。</p>
   </div>
 
+  <div class="demo-callout">
+    <p><strong>v7/v8 新专题：</strong>用可交互 bank map 理解 <code>ldmatrix</code> 冲突，以及 +8 half padding 为什么能把冲突降为 0。</p>
+    <a class="demo-link" href="ldmatrix.html">打开可视化演示</a>
+  </div>
+
   <h2>一、算的是什么：C = A × B</h2>
   <p>矩阵乘 <code>C[M×N] = A[M×K] · B[K×N]</code>，其中每个元素 <code>C[i][j] = Σₖ A[i][k]·B[k][j]</code>。
   这是所有深度学习的核心运算（全连接层、卷积的 im2col、attention 的 QKᵀ 和 PV 都是它），也是 GPU 优化的"主战场"：一个 GEMM 算得够不够快，几乎决定了模型跑得够不够快。</p>

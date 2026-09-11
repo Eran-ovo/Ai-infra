@@ -53,12 +53,17 @@ gemm_mma_shapes = (
     (63, 15, 65),
     (65, 17, 33),
     (127, 129, 131),
+    (128, 80, 192),  # vec/async 的 16-byte 对齐 fast path
 )
 max_gemm_mma_err = 0.0
 for m, k_dim, n in gemm_mma_shapes:
     a16 = torch.randn(m, k_dim, device=device, dtype=torch.float16)
     b16 = torch.randn(k_dim, n, device=device, dtype=torch.float16)
     out = ai_infra_ops.gemm_mma(a16, b16)
+    vec_out = ai_infra_ops.gemm_mma_vec(a16, b16)
+    async_out = ai_infra_ops.gemm_mma_async(a16, b16)
+    ldmatrix_out = ai_infra_ops.gemm_mma_ldmatrix(a16, b16)
+    ldmatrix_padded_out = ai_infra_ops.gemm_mma_ldmatrix_padded(a16, b16)
     cublas_out = ai_infra_ops.gemm_cublas_fp32(a16, b16)
     ref = a16.float() @ b16.float()
     max_gemm_mma_err = max(
@@ -66,9 +71,47 @@ for m, k_dim, n in gemm_mma_shapes:
         (out - ref).abs().max().item(),
     )
     torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(vec_out, ref, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(async_out, ref, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(ldmatrix_out, ref, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(ldmatrix_padded_out, ref, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(cublas_out, ref, rtol=2e-2, atol=2e-2)
 
 print(f"[GEMM MMA edge suite] PASS  maxErr={max_gemm_mma_err:.3e}")
+
+# contiguous 不代表 storage 起点仍为 16-byte 对齐；偏移 half tensor 必须回退通用路径。
+offset_a_storage = torch.randn(64 * 16 + 1, device=device, dtype=torch.float16)
+offset_b_storage = torch.randn(16 * 64 + 1, device=device, dtype=torch.float16)
+offset_a = offset_a_storage[1:].view(64, 16)
+offset_b = offset_b_storage[1:].view(16, 64)
+assert offset_a.is_contiguous() and offset_b.is_contiguous()
+assert offset_a.data_ptr() % 16 != 0 and offset_b.data_ptr() % 16 != 0
+offset_ref = offset_a.float() @ offset_b.float()
+torch.testing.assert_close(
+    ai_infra_ops.gemm_mma_async(offset_a, offset_b),
+    offset_ref,
+    rtol=2e-2,
+    atol=2e-2,
+)
+# v8 与 v5/v6 共用 16-byte fast-path dispatch 条件；未对齐时也必须安全回退 v4。
+torch.testing.assert_close(
+    ai_infra_ops.gemm_mma_ldmatrix_padded(offset_a, offset_b),
+    offset_ref,
+    rtol=2e-2,
+    atol=2e-2,
+)
+print("[GEMM MMA misaligned-storage fallback] PASS")
+
+# 确定性 fragment 映射测试：A 的每一行只选择 B 的一行。
+# 如果 ldmatrix 的四个 A 子矩阵或 B 的 .trans 顺序错误，输出会呈现整行错位。
+map_a = torch.zeros(64, 16, device=device, dtype=torch.float16)
+map_rows = torch.arange(64, device=device)
+map_a[map_rows, map_rows % 16] = 1
+map_b = ((torch.arange(16 * 64, device=device) % 31) - 15).view(16, 64).half() / 16
+map_ref = map_a.float() @ map_b.float()
+for op in (ai_infra_ops.gemm_mma_ldmatrix, ai_infra_ops.gemm_mma_ldmatrix_padded):
+    torch.testing.assert_close(op(map_a, map_b), map_ref, rtol=0, atol=0)
+print("[GEMM MMA ldmatrix deterministic mapping] PASS")
 
 # ---------------- FlashAttention（v3：N=8192 D=64） ----------------
 N2 = 8192
@@ -218,6 +261,16 @@ with torch.cuda.stream(test_stream):
     gemm_cublas_out = ai_infra_ops.gemm_cublas_fp32(ga16, gb16)
     gemm_mma_ref = ga16.float() @ gb16.float()
 
+    pipeline_a = torch.randn(64, 16, device=device, dtype=torch.float16)
+    pipeline_b = torch.randn(16, 64, device=device, dtype=torch.float16)
+    gemm_async_out = ai_infra_ops.gemm_mma_async(pipeline_a, pipeline_b)
+    # ldmatrix 是 warp 同步指令；放在非默认 stream 中可同时检查当前 stream
+    # 获取是否正确，以及扩展没有偷偷落到 legacy default stream。
+    gemm_ldmatrix_padded_out = ai_infra_ops.gemm_mma_ldmatrix_padded(
+        pipeline_a, pipeline_b
+    )
+    gemm_async_ref = pipeline_a.float() @ pipeline_b.float()
+
     sq = torch.randn(65, 64, device=device)
     sk = torch.randn_like(sq)
     sv = torch.randn_like(sq)
@@ -230,6 +283,13 @@ check("Softmax non-default stream", softmax_out, softmax_ref, 1e-4)
 check("LayerNorm non-default stream", layernorm_out, layernorm_ref, 1e-4)
 check("GEMM non-default stream", gemm_out, gemm_ref, 1e-4)
 check("GEMM MMA non-default stream", gemm_mma_out, gemm_mma_ref, 2e-2)
+check("GEMM MMA async non-default stream", gemm_async_out, gemm_async_ref, 2e-2)
+check(
+    "GEMM MMA ldmatrix+padded non-default stream",
+    gemm_ldmatrix_padded_out,
+    gemm_async_ref,
+    2e-2,
+)
 check("cuBLAS baseline non-default stream", gemm_cublas_out, gemm_mma_ref, 2e-2)
 check("FlashAttention v3 non-default stream", flash_out, flash_ref, 1e-2)
 

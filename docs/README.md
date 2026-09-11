@@ -8,6 +8,7 @@
 docs/
 ├── index.html            # 总览：三类算子 + 封装节课导航 + 共同地基（分块/合并访存/bank conflict/归约/occupancy）
 ├── gemm.html             # GEMM 类：v0 朴素 → v1 tiling → v2 ldg → v3 CUTLASS → v4 mma
+├── ldmatrix.html         # 交互专题：v7/v8 fragment 映射、LDSM bank conflict 与 padding
 ├── normalization.html    # 归约/归一化类：Softmax / LayerNorm / RMSNorm
 ├── flashattention.html   # FlashAttention 类：v1 分块 → v2 causal → v3 warp-per-row → v4 fp16 mma → v5 register P → v6 D=128
 ├── torch_ext.html        # PyTorch 封装：ai_infra_ops 模块、包装层、面试关键点、实测对比

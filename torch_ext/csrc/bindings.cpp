@@ -11,6 +11,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("layernorm",      &layernorm_forward,      "LayerNorm forward (CUDA，无 affine)");
     m.def("gemm",           &gemm_forward,           "GEMM forward (CUDA, tiled)");
     m.def("gemm_mma",       &gemm_mma_forward,       "GEMM forward (CUDA, fp16 Tensor Core mma.sync)");
+    m.def("gemm_mma_vec",   &gemm_mma_vec_forward,
+          "GEMM forward (CUDA, aligned fast path + 16-byte synchronous tile copy)");
+    m.def("gemm_mma_async", &gemm_mma_async_forward,
+          "GEMM forward (CUDA, cp.async double-buffered tile copy)");
+    m.def("gemm_mma_ldmatrix", &gemm_mma_ldmatrix_forward,
+          "GEMM forward (CUDA, warp-level ldmatrix fragment loads)");
+    m.def("gemm_mma_ldmatrix_padded", &gemm_mma_ldmatrix_padded_forward,
+          "GEMM forward (CUDA, ldmatrix + padded shared-memory rows)");
     m.def("gemm_cublas_fp32", &gemm_cublas_fp32_forward,
           "GEMM baseline (cuBLAS, fp16 input/fp32 accumulation/fp32 output)");
     m.def("flashattention", &flashattention_forward, "FlashAttention forward (CUDA, online softmax)",

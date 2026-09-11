@@ -52,6 +52,36 @@ def compare(name, custom, baseline, *, warmup, iters, rounds, detail=""):
     return custom_ms, baseline_ms
 
 
+def compare_variants(name, implementations, *, warmup, iters, rounds):
+    """同一会话轮换多个版本；最后一个实现作为速度比的 baseline。"""
+    outputs = [(label, fn()) for label, fn in implementations]
+    torch.cuda.synchronize()
+    reference = outputs[-1][1]
+    for label, output in outputs[:-1]:
+        torch.testing.assert_close(output, reference, rtol=2e-2, atol=2e-2)
+
+    for _ in range(warmup):
+        for _, fn in implementations:
+            fn()
+    torch.cuda.synchronize()
+
+    samples = {label: [] for label, _ in implementations}
+    for round_id in range(rounds):
+        offset = round_id % len(implementations)
+        order = implementations[offset:] + implementations[:offset]
+        for label, fn in order:
+            samples[label].append(event_ms(fn, iters))
+
+    medians = {label: statistics.median(values) for label, values in samples.items()}
+    baseline_label = implementations[-1][0]
+    baseline_ms = medians[baseline_label]
+    print(name)
+    for label, _ in implementations:
+        ms = medians[label]
+        print(f"  {label:<12} {ms:>8.4f} ms | {baseline_label}/{label} {baseline_ms / ms:>6.2f}x")
+    return medians
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--warmup", type=int, default=20)
@@ -123,18 +153,27 @@ def main():
     for size in (1024, 2048, 4096):
         a16 = torch.randn(size, size, device=device, dtype=torch.float16)
         b16 = torch.randn(size, size, device=device, dtype=torch.float16)
-        custom_ms, baseline_ms = compare(
-            f"GEMM MMA fp16 {size}^3",
-            lambda a=a16, b=b16: ai_infra_ops.gemm_mma(a, b),
-            lambda a=a16, b=b16: ai_infra_ops.gemm_cublas_fp32(a, b),
+        medians = compare_variants(
+            f"GEMM MMA fp16 {size}^3 (fp32 output)",
+            [
+                ("v4 scalar", lambda a=a16, b=b16: ai_infra_ops.gemm_mma(a, b)),
+                ("v5 vec", lambda a=a16, b=b16: ai_infra_ops.gemm_mma_vec(a, b)),
+                ("v6 async", lambda a=a16, b=b16: ai_infra_ops.gemm_mma_async(a, b)),
+                ("v7 ldmatrix", lambda a=a16, b=b16: ai_infra_ops.gemm_mma_ldmatrix(a, b)),
+                ("v8 ld+pad", lambda a=a16, b=b16: ai_infra_ops.gemm_mma_ldmatrix_padded(a, b)),
+                ("cuBLAS", lambda a=a16, b=b16: ai_infra_ops.gemm_cublas_fp32(a, b)),
+            ],
             warmup=max(5, args.warmup // 2),
             iters=max(5, args.iters // 10),
             rounds=args.rounds,
-            detail="fp32 output",
         )
-        custom_tflops = 2 * size**3 / (custom_ms / 1000) / 1e12
-        baseline_tflops = 2 * size**3 / (baseline_ms / 1000) / 1e12
-        print(f"{'':29} custom {custom_tflops:.2f} TFLOP/s | baseline {baseline_tflops:.2f} TFLOP/s")
+        print(
+            "  TFLOP/s     "
+            + " | ".join(
+                f"{label} {2 * size**3 / (ms / 1000) / 1e12:.2f}"
+                for label, ms in medians.items()
+            )
+        )
 
     for dim, op in ((64, ai_infra_ops.flashattention_v5), (128, ai_infra_ops.flashattention_v6)):
         q = torch.randn(1, 8, 1024, dim, device=device, dtype=torch.float16)
