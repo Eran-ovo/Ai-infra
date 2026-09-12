@@ -7,11 +7,11 @@
 ```
 docs/
 ├── index.html            # 总览：三类算子 + 封装节课导航 + 共同地基（分块/合并访存/bank conflict/归约/occupancy）
-├── gemm.html             # GEMM 类：v0 朴素 → v1 tiling → v2 ldg → v3 CUTLASS → v4 mma
+├── gemm.html             # GEMM：v0-v10、Tensor Core 数据通路与 auto dispatch
 ├── ldmatrix.html         # 交互专题：v7/v8 fragment 映射、LDSM bank conflict 与 padding
 ├── normalization.html    # 归约/归一化类：Softmax / LayerNorm / RMSNorm
-├── flashattention.html   # FlashAttention 类：v1 分块 → v2 causal → v3 warp-per-row → v4 fp16 mma → v5 register P → v6 D=128
-├── torch_ext.html        # PyTorch 封装：ai_infra_ops 模块、包装层、面试关键点、实测对比
+├── flashattention.html   # FlashAttention：v1-v7、D64/D128 与稳定 dispatch
+├── torch_ext.html        # PyTorch 封装：ai_infra_ops、包装层、绑定、校验与测试
 ├── assets/
 │   └── style.css         # 共享样式（所有分类页共用同一份）
 └── README.md             # 本文件
@@ -21,10 +21,10 @@ docs/
 
 | 类 | 共享主线 | 算子 |
 |----|---------|------|
-| GEMM | tiling 复用 + 访存优化 + 换硬件 | gemm_v0/v1/v2/v3_cutlass/v4_mma |
+| GEMM | tiling 复用 + 访存优化 + Tensor Core | v0-v10 + shape-aware auto dispatch |
 | 归约/归一化 | 块内树形归约 + warp shuffle，fusion 一次写回 | softmax / layernorm / rmsnorm |
-| FlashAttention | 分块 + online softmax（S 不落 HBM） | flashattention_v1/v2/v3/v4/v5/v6 |
-| PyTorch 封装 | 手写 kernel → torch 算子（包装层 + 绑定 + 校验） | torch_ext/csrc/*（9 个 forward） |
+| FlashAttention | 分块 + online softmax（S 不落 HBM） | v1-v7 + D64/D128 auto dispatch |
+| PyTorch 封装 | 手写 kernel → torch 算子（包装层 + 绑定 + 校验） | 18 个手写入口 + 1 个 cuBLAS 基线 |
 
 ## 如何扩展
 
@@ -62,5 +62,6 @@ docs/
 
 ## 注意
 
-- 讲「原理」以源码注释 + 仓库 README 调优记录为准，性能数字与 `kernels/README.md` 冲突时以后者实测为准。
+- 讲「原理」以源码注释和仓库 README 调优记录为准；简历性能数字只以
+  `torch_ext/benchmark_results/final_benchmark_sm86.md` 为准。
 - 新建算子后，文档里的 GFLOPS / maxErr 等数字需要实测更新，别凭空写。

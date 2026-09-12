@@ -1,91 +1,104 @@
-# cuda-kernels - 高性能算子库
+# AI Infra CUDA Operators
 
-学习 AI Infra / CUDA Kernel 优化的练习仓库。每个算子独立 `main()`，编译即可运行，自带 CPU 参考实现对拍验证。
+面向 AI Infra 岗位的 CUDA 算子库：使用 CUDA C++、inline PTX 和 PyTorch
+Extension 实现 GEMM、FlashAttention、Softmax、LayerNorm、RMSNorm，并保留从
+正确性基线、逐版本优化、Nsight Compute 定位到稳定调度接口的完整证据链。
 
-Benchmark on RTX 3060 Laptop 6GB
+当前里程碑为 **v0.1.0**。正式数据和原始样本见
+[`final_benchmark_sm86.md`](torch_ext/benchmark_results/final_benchmark_sm86.md)、
+[`JSON`](torch_ext/benchmark_results/final_benchmark_sm86.json) 与
+[`CSV`](torch_ext/benchmark_results/final_benchmark_sm86.csv)。
 
-## 环境
+## 项目亮点
 
-- GPU: NVIDIA GeForce RTX 3060 Laptop (6GB, Ampere / sm_86)
-- CUDA Toolkit: 12.4
-- OS: WSL2 (Linux)
-- 编译: `nvcc -O3`
+- 手写 Tensor Core 数据通路：`cp.async`、`ldmatrix`、
+  `mma.sync.m16n8k16`，FP16 输入、FP32 累加与输出。
+- 使用 Nsight Compute 将 GEMM 的 LDSM bank conflict 从 **5.03 亿降至 0**；
+  `4096³` 相对 v4 加速 **2.45x**，达到 **13.05 TFLOP/s**。
+- FlashAttention 支持连续 `[B,H,N,D]`、full/causal、`D=64/128`；通过缓存 Q
+  fragment 和复用 Q/K shared tile，将 shared memory 从 **24.96 KB 降至
+  16.64 KB**、实测 occupancy 从 **22.92% 提升至 28.64%**。
+- 提供 shape-aware `auto` dispatch、tail/非对齐 fallback、current-stream
+  执行、完整正确性回归，以及可复现的 CUDA Event benchmark。
 
-## 目录结构
+## v0.1.0 正式结果
 
-```
-kernels/        # 算子源码（每个 .cu 独立可编译运行）
-benchmarks/     # 编译产物（gitignore）
-ncu_flash.txt   # FlashAttention 的 Nsight Compute profiling 记录
-```
+测试环境：RTX 3060 Laptop 6 GB（Ampere / sm_86）、WSL2 Ubuntu、CUDA 12.4、
+PyTorch 2.6.0+cu124。以下只摘录简历相关结果；完整报告包含环境快照、原始
+样本、median/MAD/range 与最大误差。
 
-## 构建与运行
+| 场景 | 手写实现 | 公平基线 | 结果 |
+|---|---:|---:|---:|
+| RMSNorm FP32 `[1024,1024]` | 0.0310 ms | PyTorch 0.1116 ms | **3.59x** |
+| LayerNorm FP32 `[1024,1024]` | 0.0298 ms | PyTorch 0.0334 ms | **1.12x** |
+| Softmax FP32 `[1024,1024]` | 0.0305 ms | PyTorch 0.0290 ms | 0.95x |
+| GEMM `1024³` | auto 0.1191 ms / 18.04 TFLOP/s | v4 0.4340 ms | **3.65x** |
+| GEMM `4096³` | auto 10.5286 ms / 13.05 TFLOP/s | v4 25.8464 ms | **2.45x** |
+| FA D64 `[2,8,1024,64]` full | auto(v7) 0.6618 ms | v5 0.7489 ms | **1.13x** |
+| FA D64 `[2,8,2048,64]` full | auto(v7) 2.5258 ms | v5 2.8350 ms | **1.12x** |
 
-```bash
-# 普通算子
-nvcc -O3 kernels/gemm_v1.cu -o benchmarks/gemm_v1 && ./benchmarks/gemm_v1
+GEMM 与 cuBLAS 使用相同的 FP16 输入、FP32 累加和 FP32 输出语义；`1024³`
+达到该 cuBLAS 基线的 148.08%，`4096³` 为 63.77%。FlashAttention 当前是明确的
+优化证据链而非对 PyTorch SDPA 的性能超越：上述两个 full shape 分别达到
+SDPA 的 31.97% 和 32.13%，因此这里只表述为相对自身基线的优化。
 
-# CUTLASS 版（需额外指定头文件路径）
-nvcc -O3 -I/home/eran/cutlass/include kernels/gemm_v3_cutlass.cu -o benchmarks/gemm_v3 && ./benchmarks/gemm_v3
-```
+计时使用 CUDA Event、20 次预热、12 轮位置/前序实现双重平衡顺序并取中位数。
+正式报告在 clean commit `1d2efa0` 上生成，元数据记录 `git_dirty=false`。
 
-## 历史独立程序 Benchmark（2026-09-05 实测）
+## 稳定 API
 
-| 算子 | 版本 | 规模 | 耗时 | 性能 | 验证 |
-|------|------|------|------|------|------|
-| GEMM | v0 Naive（一线程一元素） | 1024³ | 3.53 ms | 607 GFLOPS | PASS |
-| GEMM | v1 Shared Memory Tiling（32x32，无 Bank Conflict） | 1024³ | 2.77 ms | 779 GFLOPS | PASS |
-| GEMM | v2 Coalesced + `__ldg` 只读缓存 | 1024³ | 2.72 ms | 789 GFLOPS | PASS |
-| GEMM | v3 CUTLASS 工业级实现（编译期固化 tile/warp/流水线） | 1024³ | 0.408 ms | 5259 GFLOPS | PASS |
-| GEMM | v4 手写 Tensor Core（fp16 输入 + `mma.sync.m16n8k16`，fp32 累加） | 1024³ | 0.542 ms | 3963 GFLOPS | PASS |
-| GEMM | v4 手写 Tensor Core（同上） | 2048³ | 3.889 ms | 4417 GFLOPS | PASS |
-| GEMM | v4 手写 Tensor Core（同上） | 4096³ | 26.532 ms | 5180 GFLOPS | PASS |
-| Softmax | v1 Fused（线程粗化 + 树形归约 + warp shuffle） | 1024 x 1024 | 0.046 ms | - | PASS (maxErr=1.7e-08) |
-| LayerNorm | v1 Fused（两次归约求均值/方差） | 1024 x 1024 | 0.030 ms | - | PASS (maxErr=4.5e-06) |
-| RMSNorm | v1 Fused（LLaMA 标配，一次归约） | 1024 x 1024 | 0.031 ms | - | PASS (maxErr=1.7e-06) |
-| FlashAttention | v1（分块 + Online Softmax，S 矩阵不落地 HBM） | N=512, D=64, Br/Bc=32 | 0.199 ms | - | PASS (maxErr=2.4e-07) |
-| FlashAttention | v2（v1 + causal mask，模板双模式） | N=8192, D=64, Br=256 | full 9.43 / causal 4.71 ms | 2.00x | PASS (maxErr=6.4e-07) |
-| FlashAttention | v3（一 warp 一行 + smem padding 消 bank conflict） | N=8192, D=64, Br=256 | full 17.7 / causal 8.8 ms | 2.01x | PASS (maxErr=2.4e-07) |
-| FlashAttention | v4（fp16 Tensor Core，P 经 shared-memory `Ps` 中转） | N=8192, D=64 | full 4.2508 / causal 2.4759 ms | - | PASS (N=129 tail maxErr=9.8e-04) |
-| FlashAttention | v5（v4 + P fragment 寄存器直连） | N=8192, D=64 | full 3.3810 / causal 2.1193 ms | v4/v5=1.26x/1.17x | PASS (与 v4 误差相同) |
-| FlashAttention | v6（v5 + D=128） | B=2,H=2,N=4096,D=128 | full 7.3629 / causal 3.5975 ms | vs SDPA 3.95x/3.57x | PASS |
-| FlashAttention | v7（D=64，Q fragment 寄存器缓存 + Q/K smem 复用） | B=2,H=8,N=1024,D=64 | full 0.6500 / causal 0.4254 ms | vs v5 1.13x/1.09x | PASS (v5/v7 逐元素相同) |
-
-> 注：这是各个独立 `.cu` 程序的阶段性历史数据。当前跨实现对比统一使用 [`torch_ext/bench_ops.py`](torch_ext/bench_ops.py)：CUDA Event 计时、预热、交错多轮中位数，并保证 dtype、累加精度和输出 dtype 一致。不要把两种测量口径的数字混用。
-
-## 当前稳定接口与简历主线
-
-实验版本用于展示优化过程，项目使用方优先调用 PyTorch Extension 中的稳定入口：
+实验版本用于消融和展示优化过程，使用方只需要调用稳定入口：
 
 ```python
-out = ai_infra_ops.gemm_mma_auto(a, b)
-attn = ai_infra_ops.flashattention_auto(q, k, v, causal=False)
+import torch
+import ai_infra_ops
+
+# FP16 [M,K] @ [K,N] -> FP32 [M,N]
+c = ai_infra_ops.gemm_mma_auto(a, b)
+
+# FP16 [B,H,N,D] -> FP16 [B,H,N,D]，D 支持 64/128
+o = ai_infra_ops.flashattention_auto(q, k, v, causal=True)
+
+y0 = ai_infra_ops.softmax(x)
+y1 = ai_infra_ops.layernorm(x, 1e-5)
+y2 = ai_infra_ops.rmsnorm(x, weight, 1e-5)
 ```
 
-`gemm_mma_auto` 使用 shape-aware 三层调度：小 token-batch 的完整 tile 选择 BK32 v10，其他形状选择更稳定的 v8，tail 或非对齐 storage 最终回退 v4。Transformer projection 形状由 [`torch_ext/bench_gemm_transformer.py`](torch_ext/bench_gemm_transformer.py) 复现。这个接口标志着 GEMM 主线从“实验 kernel”进入“可用算子 API”阶段。
+`gemm_mma_auto` 对小 token-batch 完整 tile 选择 BK32 v10，其他完整 tile 选择
+v8，tail 或非对齐 storage 回退 v4。`flashattention_auto` 对 D64 按序列长度选择
+v5/v7，对 D128 选择 v6；不支持的维度明确报错。
 
-当前简历表述草稿：
+## 快速复现
 
-> 基于 CUDA C++/inline PTX 与 PyTorch Extension 开发高性能算子库，实现 GEMM、FlashAttention、Softmax、LayerNorm、RMSNorm；手写 `mma.sync`、`ldmatrix` 与 `cp.async` 流水，通过 Nsight Compute 将 GEMM LDSM bank conflict 从 5.03 亿降至 0，RTX 3060 Laptop 上 `4096³` FP16-input/FP32-output GEMM 相对初版加速约 2.4x、达到约 14 TFLOP/s，并实现 shape-aware fast-path/fallback 调度及完整边界、stream 正确性测试。
->
-> 使用 Nsight Compute 定位 FlashAttention 的 shared-memory/MIO 压力，通过寄存器缓存 Q MMA fragment 并复用 Q/K shared tile，将 shared memory 从 24.96 KB 降至 16.64 KB、实测 occupancy 从 22.92% 提升至 28.64%，在 D64、N>=1024 的多组 B×H shape 上相对基线加速约 1.1x–1.14x，并实现 D64/D128 稳定调度。
+```bash
+cd torch_ext
 
-FlashAttention 也已有第一版稳定入口：`head_dim=64` 且 `N>=1024` 路由到 v7，
-较短 D64 路由到 v5，`head_dim=128` 路由到 v6，其他维度明确报错。D64 阈值来自
-固定 N 扫描和固定 N 的 B×H 扫描，仍需在更多真实模型 shape 上继续验证。
+# 环境预检、按当前 GPU 架构增量编译、运行完整正确性测试
+./build_and_test.sh
 
-构建工程化里程碑已完成：`torch_ext/build_and_test.sh` 会检查 Python、CUDA、
-GPU 架构和 Ninja，随后执行增量编译与完整正确性测试；同时固定 Ninja
-`1.11.1.4`，规避 1.13.2 损坏 `.ninja_deps` 并重复全量编译的已知回归。
-连续两次实机验证中，第二次构建已达到 `ninja: no work to do.`。
+# 先验证 benchmark 流程；quick 数据不能用于简历
+~/venvs/torch/bin/python bench_final.py --quick --warmup 2 --iters 3
 
-最终 benchmark 流程也已固化为 `torch_ext/bench_final.py`：使用 CUDA Event、
-位置/前序实现双重平衡顺序和多轮中位数，保存环境、每轮原始样本、MAD、
-极差、正确性误差及 TFLOP/s。当前 sm_86 实机正式报告见
-[`final_benchmark_sm86.md`](torch_ext/benchmark_results/final_benchmark_sm86.md)。
-该报告在 clean commit `1d2efa0` 上运行，元数据记录 `git_dirty=false`，原始
-样本同时保存为 JSON/CSV。至此第一版简历主线已经收尾，后续 kernel 迭代应
-建立在该版本基线上，不能用新的单次数据覆盖这份可复现结果。
+# 生成本机正式 JSON / CSV / Markdown 报告
+~/venvs/torch/bin/python bench_final.py --name final_benchmark_local
+```
+
+依赖安装、全部 API 和单项 benchmark 命令见
+[`torch_ext/README.md`](torch_ext/README.md)。
+
+## 工程结构
+
+```text
+torch_ext/csrc/              # PyTorch 绑定、稳定 dispatch 与生产 kernel
+torch_ext/test_all.py        # 正确性、边界、非对齐 storage、stream 测试
+torch_ext/bench_final.py     # 可复现的统一 benchmark 与报告生成
+torch_ext/benchmark_results/ # v0.1.0 正式结果和原始样本
+kernels/                     # 从 naive 到 Tensor Core 的独立教学版本
+docs/                        # 算子原理与可视化说明
+```
+
+下面保留逐版本调优记录。它回答的不只是“最终多快”，还包括每次为什么改、
+如何验证假设，以及哪些优化在当前硬件上没有收益。
 
 ## 调优实战记录（ncu 性能分析）
 

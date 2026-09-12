@@ -23,7 +23,7 @@
 
   <div class="hero">
     <h1>FlashAttention：分块 + Online Softmax</h1>
-    <p class="sub">六个版本复现 FA2：v1 分块 + online softmax → v2 causal → v3 warp-per-row → v4 fp16 Tensor Core → v5 P fragment 寄存器直连 → v6 D=128。核心主张始终是「让 S 矩阵永不落地 HBM」。</p>
+    <p class="sub">七个版本复现 FlashAttention 数据流：v1 分块 + online softmax → v2 causal → v3 warp-per-row → v4 fp16 Tensor Core → v5 P fragment 寄存器直连 → v6 D=128 → v7 Q fragment 寄存器缓存。核心主张始终是「让 S 矩阵永不落地 HBM」。</p>
   </div>
 
   <h2>一、先看标准 attention 哪里"贵"</h2>
@@ -230,7 +230,19 @@ pa3 = half2(S[st + 1][2], S[st + 1][3]);  // row g+8, cols 8..15</pre>
     <div class="tip"><b>学习重点</b>：head dimension 是 kernel 设计参数，不是普通 shape 参数。它同时改变算术工作量、shared-memory 容量、寄存器文件占用和 occupancy，必须用 ptxas + NCU + benchmark 一起判断。</div>
   </div>
 
-  <h2>四、六版区别总览</h2>
+  <div class="op v-highlight">
+    <div class="op-head">
+      <span class="op-title">v7 · Q fragment 寄存器缓存</span>
+      <span class="op-file">kernels/flashattention_v7.cu</span>
+      <span class="op-perf">D64 N=1024 full · 相对 v5 1.13x</span>
+    </div>
+    <p><strong>假设</strong>：v5 每扫一个 KV tile 都会重新从 shared memory 加载同一份 Q fragment；长序列中这份重复片上搬运会放大 MIO 压力。</p>
+    <p><strong>改法</strong>：Q 先合作式进入 shared memory，再把每个 lane 需要的 MMA fragment 缓存在寄存器中并跨 KV tile 复用；Q/K 同时复用一块 shared tile，使 static shared memory 从 24.96 KB 降到 16.64 KB。</p>
+    <p><strong>验证</strong>：full 路径实测 occupancy 从 22.92% 提升到 28.64%；正式报告中 <code>[2,8,1024,64]</code> 和 <code>[2,8,2048,64]</code> full 相对 v5 分别加速 1.13x/1.12x。短序列收益不稳定，因此稳定入口只在 <code>D=64 &amp;&amp; N&gt;=1024</code> 时路由 v7。</p>
+    <div class="tip"><b>关键认识</b>：降低 shared memory 不一定降低片上压力——寄存器会增加，MIO stall 占比也可能上升。最终调度阈值必须来自 shape 扫描，而不是只看单个 NCU 指标。</div>
+  </div>
+
+  <h2>四、七版区别总览</h2>
   <table>
     <tr><th>版本</th><th>线程映射</th><th>精度</th><th>causal</th><th>核心增量</th></tr>
     <tr><td>v1</td><td>一线程一行</td><td>fp32</td><td>否</td><td>分块 + online softmax（S 不落 HBM）</td></tr>
@@ -239,9 +251,10 @@ pa3 = half2(S[st + 1][2], S[st + 1][3]);  // row g+8, cols 8..15</pre>
     <tr><td>v4</td><td>一 warp 16 行</td><td>fp16 / fp32 累加</td><td>✔ 模板双模式</td><td>手写 mma.sync + K/V tail mask + causal mask</td></tr>
     <tr><td>v5</td><td>一 warp 16 行</td><td>fp16 / fp32 累加</td><td>✔ 模板双模式</td><td>QK 的 C fragment 直连 PV 的 A fragment，删除 Ps</td></tr>
     <tr><td>v6</td><td>一 warp 16 行</td><td>fp16 / fp32 累加</td><td>✔ 模板双模式</td><td>D=128：8 个 QK reduction step + 16 个 PV output tile</td></tr>
+    <tr><td>v7</td><td>一 warp 16 行</td><td>fp16 / fp32 累加</td><td>✔ 模板双模式</td><td>D=64：Q fragment 跨 KV tile 缓存 + Q/K shared tile 复用</td></tr>
   </table>
 
-  <div class="note"><b>一句话主线</b>：v1 奠定"分块 + online softmax"的正确性骨架；v2 补 causal 并踩出 occupancy 的教训；v3 用 warp-per-row 重划分工作；v4 把两个 GEMM 换成 Tensor Core并以 Ps 建立清晰基线；v5 删除 Ps 中转；v6 证明 D=128 会重新引入片上容量和寄存器瓶颈。</div>
+  <div class="note"><b>一句话主线</b>：v1 奠定"分块 + online softmax"的正确性骨架；v2 补 causal 并踩出 occupancy 的教训；v3 用 warp-per-row 重划分工作；v4 把两个 GEMM 换成 Tensor Core 并以 Ps 建立清晰基线；v5 删除 Ps 中转；v6 证明 D=128 会重新引入片上容量和寄存器瓶颈；v7 进一步用 Q fragment 生命周期换取更少的 shared-memory 搬运，并通过 shape 扫描收敛到稳定 dispatch。</div>
 
   <div class="footer">
     <span>cuda-kernels · FlashAttention 类</span>

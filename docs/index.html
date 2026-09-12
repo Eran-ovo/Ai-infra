@@ -42,10 +42,10 @@
   <div class="grid">
 
     <div class="card">
-      <span class="kind">矩阵乘 · 5 版</span>
+      <span class="kind">矩阵乘 · v0-v10 + auto</span>
       <h3>GEMM</h3>
       <p><strong>主线</strong>：分块复用 + 访存优化，把「每线程算一个 C」逐步升级成「每 warp 用 Tensor Core 算 16×8×16」。</p>
-      <p><strong>覆盖</strong>：gemm_v0 朴素 → v1 smem tiling → v2 ldg 只读缓存 → v3 CUTLASS → v4 手写 mma.sync</p>
+      <p><strong>覆盖</strong>：v0 朴素 → tiling/CUTLASS → 手写 mma.sync → cp.async/ldmatrix/padding → shape-aware auto dispatch</p>
       <a class="more" href="gemm.html">详读原理与区别 →</a>
     </div>
 
@@ -66,10 +66,10 @@
     </div>
 
     <div class="card">
-      <span class="kind">注意力 · 6 版</span>
+      <span class="kind">注意力 · 7 版 + auto</span>
       <h3>FlashAttention</h3>
       <p><strong>主线</strong>：分块 + Online Softmax，让中间 S 矩阵永不落地 HBM；再逐步 FA2 化（warp-per-row → Tensor Core）。</p>
-      <p><strong>覆盖</strong>：v1 online softmax → v2 causal → v3 warp-per-row → v4 fp16 mma + Ps → v5 register P → v6 D=128</p>
+      <p><strong>覆盖</strong>：v1 online softmax → causal/warp 重划分 → Tensor Core/register P → v6 D=128 → v7 Q fragment 缓存 → auto dispatch</p>
       <a class="more" href="flashattention.html">详读原理与区别 →</a>
     </div>
 

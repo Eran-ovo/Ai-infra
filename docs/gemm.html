@@ -23,11 +23,11 @@
 
   <div class="hero">
     <h1>GEMM：从朴素循环到手写 Tensor Core</h1>
-    <p class="sub">一类算子、五版迭代：v0 朴素 → v1 smem tiling → v2 ldg → v3 CUTLASS → v4 手写 mma.sync。目标 M=N=K=1024，RTX 3060 Laptop 实测。</p>
+    <p class="sub">独立程序从 v0 朴素推进到 v4 手写 mma.sync；PyTorch Extension 继续完成 v5-v10 的向量搬运、cp.async、ldmatrix、padding 与 BK32 实验，最终收敛为 shape-aware auto dispatch。</p>
   </div>
 
   <div class="demo-callout">
-    <p><strong>v7/v8 新专题：</strong>用可交互 bank map 理解 <code>ldmatrix</code> 冲突，以及 +8 half padding 为什么能把冲突降为 0。</p>
+    <p><strong>v7/v8 专题：</strong>用可交互 bank map 理解 <code>ldmatrix</code> 冲突，以及 +8 half padding 为什么能把冲突降为 0。</p>
     <a class="demo-link" href="ldmatrix.html">打开可视化演示</a>
   </div>
 
@@ -208,9 +208,20 @@ gemm_op(args);</pre>
     </ul>
   </div>
 
+  <div class="op v-highlight">
+    <div class="op-head">
+      <span class="op-title">v5-v10 + auto · 从实验 kernel 到稳定入口</span>
+      <span class="op-file">torch_ext/csrc/gemm_mma_cuda.cu</span>
+      <span class="op-perf">v0.1.0 · 4096³ 13.05 TFLOP/s</span>
+    </div>
+    <p><strong>演进</strong>：v5 增加 16-byte 对齐搬运；v6 用 <code>cp.async</code> 双缓冲；v7 改用 <code>ldmatrix</code> 后暴露 5.03 亿次 bank conflict；v8 由 bank 映射公式推导 padding 并将冲突清零；v9 证明 BK16 下异步流水开销无法被短计算窗口覆盖；v10 用 BK32 扩大每次预取后的计算量。</p>
+    <p><strong>收敛</strong>：单一 tile 不能覆盖所有 shape，因此 <code>gemm_mma_auto</code> 对小 token-batch 完整 tile 选择 v10，其他完整 tile 选择 v8，tail 或非对齐 storage 回退 v4。正式报告中 <code>1024³/4096³</code> 相对 v4 分别加速 3.65x/2.45x。</p>
+    <div class="tip"><b>工程结论</b>：高级指令本身不是性能保证；global→shared 流水、shared layout、fragment 装载和 shape dispatch 必须共同设计。完整 v7/v8 bank 分析见上方交互专题，正式数据见仓库的 <code>torch_ext/benchmark_results/</code>。</div>
+  </div>
+
   <div class="definition"><b>性能数字怎么来的：</b>对方阵 GEMM，<code>GFLOPS = 2·M·N·K / 时间(秒) / 10⁹</code>。GFLOPS 只说明吞吐，不等于“任何形状都一样快”；本文数字固定在对应的矩阵尺寸、数据类型和预热/计时口径下比较。</div>
 
-  <h2>四、五版区别总览</h2>
+  <h2>四、独立程序五版区别总览</h2>
   <table>
     <tr><th>版本</th><th>关键动作</th><th>解决什么</th><th>GFLOPS</th><th>相对 v0</th></tr>
     <tr><td>v0 naive</td><td>一线程一元素，全走全局内存</td><td>（基线）</td><td class="num">607</td><td class="num">1.0x</td></tr>
@@ -220,7 +231,7 @@ gemm_op(args);</pre>
     <tr><td>v4 mma</td><td>手写 mma.sync.m16n8k16，fp16 输入 fp32 累加</td><td>换硬件：FMA → Tensor Core</td><td class="num good">3963（单次）</td><td class="num good">6.5x</td></tr>
   </table>
 
-  <div class="note"><b>一句话主线</b>：v1 解决"数据复用在 smem"，v2 解决"搬运合并 + 只读缓存"，v3 立出工业天花板，v4 用 Tensor Core 从 789 GFLOPS 跳到 ~4000+ GFLOPS，与 cuBLAS（~10 TFLOPS）差距缩到 2-4 倍。剩余差距来自无 cp.async 双缓冲 / ldmatrix / 大 tile——是后续迭代点。</div>
+  <div class="note"><b>一句话主线</b>：v1 解决 smem 数据复用，v2 验证只读缓存的有限收益，v3 立出工业参照，v4 切换 Tensor Core；Extension 中的 v5-v10 再用受控实验处理搬运、bank conflict 和流水窗口，最终由 auto dispatch 对外隐藏版本选择。</div>
 
   <div class="footer">
     <span>cuda-kernels · GEMM 类</span>

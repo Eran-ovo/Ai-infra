@@ -36,12 +36,12 @@ AI_INFRA_PYTHON=/path/to/python MAX_JOBS=2 ./build_and_test.sh
 ~/venvs/torch/bin/python bench_ops.py
 ```
 
-项目收尾时使用统一最终测试入口。默认覆盖归约算子、cubic/Transformer GEMM、
+正式性能测试使用统一入口。默认覆盖归约算子、cubic/Transformer GEMM、
 FlashAttention D64/D128 的 full/causal，并输出带环境信息和原始样本的
 JSON、CSV、Markdown 到 `benchmark_results/`：
 
 ```bash
-~/venvs/torch/bin/python bench_final.py
+~/venvs/torch/bin/python bench_final.py --name final_benchmark_local
 ```
 
 修改脚本后先用快速模式检查流程；快速模式迭代次数少，结果不能用于简历：
@@ -77,21 +77,29 @@ ai_infra_ops.flashattention_v7(q, k, v, causal)    # v7：D=64，Q fragment 寄�
 ai_infra_ops.flashattention_auto(q, k, v, causal)  # 稳定入口：D64按N路由v5/v7，D128路由v6
 ```
 
-## 实测结果（RTX 3060 Laptop，`bench_ops.py` 复现）
+## v0.1.0 正式结果（唯一简历口径）
 
-| 算子 | 手写 CUDA | 同语义基线 | baseline/custom |
-|------|----------|-------------|--------|
-| RMSNorm fp32 `[1024,1024]` | 0.0308 ms | `F.rms_norm` 0.1113 ms | **3.61x** |
-| Softmax fp32 `[1024,1024]` | 0.0298 ms | `torch.softmax` 0.0296 ms | 0.99x |
-| LayerNorm fp32 `[1024,1024]`（无 affine） | 0.0294 ms | `F.layer_norm` 0.0342 ms | 1.16x |
-| GEMM fp32 `1024³`（TF32 off） | 2.4011 ms / 0.89 TFLOP/s | cuBLAS 0.2971 ms / 7.23 TFLOP/s | 0.12x |
-| GEMM MMA v8 ldmatrix+padding `1024³`，fp32 输出 | 0.1209 ms / 17.76 TFLOP/s | cuBLAS 0.1779 ms / 12.07 TFLOP/s | 1.47x |
-| GEMM MMA v8 ldmatrix+padding `2048³`，fp32 输出 | 0.9964 ms / 17.24 TFLOP/s | cuBLAS 1.0273 ms / 16.72 TFLOP/s | 1.03x |
-| GEMM MMA v8 ldmatrix+padding `4096³`，fp32 输出 | 9.9003 ms / 13.88 TFLOP/s | cuBLAS 6.7062 ms / 20.49 TFLOP/s | 0.68x |
-| FlashAttention v5 D=64 | 0.4025 ms | PyTorch SDPA 0.1272 ms | 0.32x |
-| FlashAttention v6 D=128 | 0.8789 ms | PyTorch SDPA 0.2388 ms | 0.27x |
+正式报告：[`benchmark_results/final_benchmark_sm86.md`](benchmark_results/final_benchmark_sm86.md)。
+同目录的 [JSON](benchmark_results/final_benchmark_sm86.json) 保存环境和每轮原始
+样本，[CSV](benchmark_results/final_benchmark_sm86.csv) 便于二次分析。
 
-默认测速使用 CUDA Event、20 次预热、每组 100 次迭代、交错 7 轮取中位数；GEMM 版本链可用 `bench_gemm_mma.py` 指定尺寸顺序、预热、迭代和轮数。正确性测试与性能测试分离：`test_all.py` 不输出性能结论。GEMM MMA 的两侧都使用 fp16 输入、fp32 累加和 fp32 输出；这是关键约束，因为直接比较 `torch.matmul(fp16)` 会得到 fp16 输出，数值语义和写回带宽都不一致。笔记本 GPU 会受温度与功耗墙影响，因此表中结果只表示同一轮、同一语义下的实机观测；尤其 `1024³` 超过该 cuBLAS 入口不能外推成“普遍超过 cuBLAS”。
+| 场景 | 手写实现 | 公平基线 | 结果 |
+|---|---:|---:|---:|
+| RMSNorm FP32 `[1024,1024]` | 0.0310 ms | PyTorch 0.1116 ms | **3.59x** |
+| LayerNorm FP32 `[1024,1024]` | 0.0298 ms | PyTorch 0.0334 ms | **1.12x** |
+| Softmax FP32 `[1024,1024]` | 0.0305 ms | PyTorch 0.0290 ms | 0.95x |
+| GEMM `1024³` | auto 0.1191 ms / 18.04 TFLOP/s | v4 0.4340 ms | **3.65x** |
+| GEMM `4096³` | auto 10.5286 ms / 13.05 TFLOP/s | v4 25.8464 ms | **2.45x** |
+| FA D64 `[2,8,1024,64]` full | auto(v7) 0.6618 ms | v5 0.7489 ms | **1.13x** |
+| FA D64 `[2,8,2048,64]` full | auto(v7) 2.5258 ms | v5 2.8350 ms | **1.12x** |
+
+正式脚本使用 CUDA Event、20 次预热、12 轮位置/前序实现双重平衡顺序并取
+中位数，同时保存 MAD、极差和最大误差。GEMM 与 cuBLAS 使用相同的 FP16 输入、
+FP32 累加和 FP32 输出语义。FlashAttention 当前只宣称相对自身基线的优化；
+其绝对性能仍为 PyTorch SDPA 的约 26%–34%。下文各专项表是不同阶段的受控
+实验记录，用来解释优化因果，不能与本节数字混为一次测试结果。
+
+## 专项优化记录
 
 ### GEMM v4 → v8：从搬运流水到 `ldmatrix` layout
 
@@ -154,7 +162,7 @@ stage 1: 同时接收下一个 tile 的 cp.async
 交换 read_stage/write_stage
 ```
 
-首个 tile 仍然必须 `commit → wait → __syncthreads`，因为它没有前一轮 MMA 可以用来覆盖加载延迟。后续每轮才预取到另一个 buffer；当前 `read_stage` 正被 `ldmatrix` 读取时，绝不能写回同一个 stage。源码中的阶段注释见 [gemm_mma_cuda.cu](/home/eran/cuda-kernels/torch_ext/csrc/gemm_mma_cuda.cu:288)。
+首个 tile 仍然必须 `commit → wait → __syncthreads`，因为它没有前一轮 MMA 可以用来覆盖加载延迟。后续每轮才预取到另一个 buffer；当前 `read_stage` 正被 `ldmatrix` 读取时，绝不能写回同一个 stage。源码中的阶段注释见 [gemm_mma_cuda.cu](csrc/gemm_mma_cuda.cu)。
 
 | Shape | v8 ld+pad | v9 async+ld+pad | v9 相对 v8 | cuBLAS |
 |---:|---:|---:|---:|---:|
@@ -168,7 +176,7 @@ stage 1: 同时接收下一个 tile 的 cp.async
 
 ### v10：增大 BK，让一次预取覆盖两个 K-slice
 
-v10 将这个假设落实为独立文件 [gemm_mma_v10_cuda.cu](/home/eran/cuda-kernels/torch_ext/csrc/gemm_mma_v10_cuda.cu:1)。它把 `BK=16` 改为 `BK=32`，但 Tensor Core 的基本指令仍然是 `mma.sync.m16n8k16`，因此一个 `BK=32` tile 只是连续执行两个 K-slice：
+v10 将这个假设落实为独立文件 [gemm_mma_v10_cuda.cu](csrc/gemm_mma_v10_cuda.cu)。它把 `BK=16` 改为 `BK=32`，但 Tensor Core 的基本指令仍然是 `mma.sync.m16n8k16`，因此一个 `BK=32` tile 只是连续执行两个 K-slice：
 
 ```text
 shared A/B tile: K = 32
@@ -215,7 +223,7 @@ v10 的寄存器数反而下降，但 shared memory block limit 从 10 降到 5�
 
 ### 稳定 GEMM 入口：shape-aware dispatch
 
-实验 API 用于保留学习证据，用户侧则应只依赖 `gemm_mma_auto(a, b)`。host-only 路由实现在 [gemm_dispatch.cpp](/home/eran/cuda-kernels/torch_ext/csrc/gemm_dispatch.cpp:1)，采用三层结构：
+实验 API 用于保留学习证据，用户侧则应只依赖 `gemm_mma_auto(a, b)`。host-only 路由实现在 [gemm_dispatch.cpp](csrc/gemm_dispatch.cpp)，采用三层结构：
 
 ```text
 M<=256，M/N 为 64 倍数，K 为 32 倍数，指针 16B 对齐
@@ -235,7 +243,7 @@ python bench_gemm_transformer.py --warmup 20 --iters 20 --rounds 7
 
 一次 RTX 3060 Laptop 运行中，`[128,4096]@[4096,4096]` 的 auto/v8/v10 分别为 0.3109/0.3363/0.3158 ms；auto 与实际路由版本之间的微小差异来自交错顺序和 GPU 频率，不应解释成 dispatch 本身带来 kernel 加速。这个阶段的工程收益是统一 API、明确回退和真实模型形状验证。
 
-### 2026-09-12 实机验证记录
+### v0.1.0 实机验证记录
 
 本次在 RTX 3060 Laptop（sm_86，6GB）上重新编译并运行 `test_all.py`。PyTorch 为 `2.6.0+cu124`，CUDA Toolkit 为 `12.4`。WSL 的 `/usr/lib/wsl/lib` 已加入 `PATH`，`nvidia-smi` 与 PyTorch 均可识别 GPU：`torch.cuda.is_available() == True`、`device_count == 1`。
 
@@ -243,41 +251,26 @@ python bench_gemm_transformer.py --warmup 20 --iters 20 --rounds 7
 
 ```bash
 cd torch_ext
-export TORCH_CUDA_ARCH_LIST="8.6"
-~/venvs/torch/bin/python setup.py build_ext --inplace
-~/venvs/torch/bin/python test_all.py
+./build_and_test.sh
 ```
 
-正确性结果：
+收尾回归通过以下测试组：
 
 ```text
-[RMSNorm] PASS  maxErr=9.537e-07
-[Softmax] PASS  maxErr=7.451e-09
-[LayerNorm] PASS  maxErr=9.537e-07
-[GEMM] PASS  maxErr=2.136e-04
-[GEMM MMA edge suite] PASS  maxErr=2.670e-05
-[GEMM MMA misaligned-storage fallback] PASS
-[GEMM MMA ldmatrix deterministic mapping] PASS
-[FlashAttention full] PASS  maxErr=1.602e-07
-[FlashAttention causal] PASS  maxErr=3.576e-07
-[FlashAttention v4 full] PASS  maxErr=4.883e-04
-[FlashAttention v4 causal] PASS  maxErr=9.766e-04
-[FlashAttention v5 full] PASS  maxErr=4.883e-04
-[FlashAttention v5 causal] PASS  maxErr=9.766e-04
-[FlashAttention v6 D128 full] PASS  maxErr=4.883e-04
-[FlashAttention v6 D128 causal] PASS  maxErr=2.441e-04
-[GEMM MMA ldmatrix+padded non-default stream] PASS  maxErr=2.861e-06
-[GEMM MMA async+ldmatrix+padded non-default stream] PASS  maxErr=2.861e-06
-[GEMM MMA v10 BK32 non-default stream] PASS  maxErr=5.722e-06
-[GEMM MMA auto non-default stream] PASS  maxErr=5.722e-06
+[RMSNorm / Softmax / LayerNorm] PASS
+[GEMM v4-v10 / auto / cuBLAS baseline] PASS
+[GEMM edge / misaligned-storage fallback / deterministic mapping] PASS
+[FlashAttention v3-v7 / auto / D64 / D128 / full / causal] PASS
+[FlashAttention tail / BHD addressing] PASS
+[All operators on non-default CUDA stream] PASS
 [PyTorch CUDA contract suite] PASS
 ```
 
-v4/v5 测试使用 `N=129`，专门覆盖不是 64 倍数的 K/V 尾块，同时验证 full 和 causal 两种模式。两版输出为 fp16，reference 使用 fp16 输入、fp32 计算后再转回 fp16，误差阈值为 `2e-2`。v4/v5 的误差逐项完全相同，说明 v5 只改变 P 的搬运路径，没有改变数值语义。
+v4/v5/v7 测试使用 `N=129`，专门覆盖不是 64 倍数的 K/V 尾块，同时验证 full 和 causal 两种模式。三版输出为 fp16，reference 使用 fp16 输入、fp32 计算后再转回 fp16，误差阈值为 `2e-2`。v4/v5/v7 的结果逐项一致，说明后两版只改变数据搬运路径，没有改变数值语义。
 
 额外边界回归覆盖 `N={1,7,63,64,65,127,128,129,257}` 的 full/causal，结果为 `PASS maxErr=9.766e-04, v4-v5=0`。这些尺寸覆盖 64×64 tile 的边界前、边界上、边界后以及多个 KV tile。
 
-批量多头回归使用 `[B,H,N,D]=[2,3,65,64]`，full/causal 对拍 `torch.nn.functional.scaled_dot_product_attention`，最大误差分别为 `2.441e-04` 和 `1.221e-04`。`N=65` 同时验证每个 head 的地址隔离和 K/V tail。
+批量多头回归使用 `[B,H,N,D]=[2,3,65,64]`，full/causal 对拍 `torch.nn.functional.scaled_dot_product_attention`，最大误差不超过 `2.441e-04`。`N=65` 同时验证每个 head 的地址隔离和 K/V tail。
 
 ### 批量多头：二维 CUDA grid
 
@@ -294,7 +287,7 @@ O += sequence_offset;
 
 每个 `(batch,head)` 的 softmax 状态完全独立，但所有 head 在同一次 kernel launch 中进入 GPU。使用 `B=2,H=8,N=1024,D=64`，预热 30 次、每轮 100 次迭代并取平衡顺序的 10 轮中位数：
 
-| 模式 | auto | v5 BHD | v7 Q-reg | Python 逐 head | PyTorch SDPA | v7/v5 |
+| 模式 | auto | v5 BHD | v7 Q-reg | Python 逐 head | PyTorch SDPA | v7 latency / v5 latency |
 |---|---:|---:|---:|---:|---:|---:|
 | full | 0.6394 ms | 0.7227 ms | 0.6398 ms | 2.1435 ms | 0.2082 ms | **0.89x** |
 | causal | 0.4150 ms | 0.4552 ms | 0.4207 ms | 2.1429 ms | 0.1372 ms | **0.92x** |
@@ -347,12 +340,14 @@ v5 的 D=64 不是把宏改成 128 就结束。D 同时影响三条路径：QK �
 
 正确性测试使用连续 `[B,H,N,D]=[2,2,65,128]`，full/causal 均与 SDPA 对齐。性能脚本为 [bench_flashattention_d128.py](bench_flashattention_d128.py)，同一输入、交错 5 轮中位数：
 
-| N | 模式 | v6 D=128 | PyTorch SDPA | v6/SDPA |
+| N | 模式 | v6 D=128 | PyTorch SDPA | v6 latency / SDPA latency |
 |---:|---|---:|---:|---:|
 | 1024 | full | 0.8180 ms | 0.2513 ms | 3.25x |
 | 1024 | causal | 0.3210 ms | 0.1005 ms | 3.20x |
 | 4096 | full | 7.3629 ms | 1.8643 ms | 3.95x |
 | 4096 | causal | 3.5975 ms | 1.0083 ms | 3.57x |
+
+最后一列是耗时比，因此大于 1 表示 v6 比 SDPA 慢；它不是加速比。
 
 ptxas/NCU 资源结果：
 
