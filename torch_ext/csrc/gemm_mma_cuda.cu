@@ -244,6 +244,8 @@ __device__ __forceinline__ void copy_tile_async(
 // USE_ASYNC=true ：保持相同 fast-path 映射，只增加 cp.async + 双缓冲，隔离流水收益。
 // USE_LDMATRIX=true：保持同步搬运，只替换 shared→fragment 路径，隔离 ldmatrix 收益。
 // USE_SMEM_PADDING=true：A/B 每行增加 8 个 half，打散 ldmatrix 的 bank 映射。
+// v9 = <true, true, true>：把两种独立优化组合起来，用于验证
+// global→shared 的异步预取能否与无冲突的 shared→fragment 路径重叠。
 // 该 kernel 只处理 M%64=N%64=0、K%16=0 的 fast path。
 template <bool USE_ASYNC, bool USE_LDMATRIX, bool USE_SMEM_PADDING>
 __global__ void gemm_mma_pipeline(const __half* __restrict__ A,
@@ -288,6 +290,8 @@ __global__ void gemm_mma_pipeline(const __half* __restrict__ A,
     int read_stage = 0;
     // 先加载第一个 tile
     if constexpr (USE_ASYNC) {
+        // 这个等待只负责首个 tile：后续 tile 才能在 MMA 计算期间预取。
+        // 不能删除，否则第一次 ldmatrix 可能读取尚未完成的 shared memory。
         copy_tile_async(A, B, &As[0][0][0], &Bs[0][0][0],
                         AS_STRIDE, BS_STRIDE,
                         m_base, n_base, 0, K, N, tid);
@@ -301,7 +305,8 @@ __global__ void gemm_mma_pipeline(const __half* __restrict__ A,
             const int next_kt = kt + BK;
             if (next_kt < K) {
                 const int write_stage = read_stage ^ 1;
-                // 预取下一个 tile 到另一个 shared-memory buffer
+                // 预取到另一个 buffer；当前 read_stage 在下面继续被 ldmatrix
+                // 使用，因此写入阶段不能与读取阶段相同。
                 copy_tile_async(A, B,
                                 &As[write_stage][0][0], &Bs[write_stage][0][0],
                                 AS_STRIDE, BS_STRIDE,
@@ -369,7 +374,9 @@ __global__ void gemm_mma_pipeline(const __half* __restrict__ A,
         }
 
         if constexpr (USE_ASYNC) {
-            // 等待下一个 tile 加载完成
+            // cp.async 的完成保证在这里转化为 shared-memory 可见性；随后
+            // 才交换 read_stage。__syncthreads 还负责让整个 block 的 lane
+            // 以一致阶段进入下一轮 ldmatrix。
             if (kt + BK < K) {
                 cp_async_wait_all();
                 __syncthreads();
@@ -492,6 +499,11 @@ torch::Tensor gemm_mma_ldmatrix_forward(torch::Tensor a, torch::Tensor b) {
 
 torch::Tensor gemm_mma_ldmatrix_padded_forward(torch::Tensor a, torch::Tensor b) {
     return gemm_mma_pipeline_forward<false, true, true>(a, b);
+}
+
+torch::Tensor gemm_mma_ldmatrix_async_padded_forward(torch::Tensor a, torch::Tensor b) {
+    // v9：保持 v8 的无冲突 layout，同时打开 v6 的双缓冲预取。
+    return gemm_mma_pipeline_forward<true, true, true>(a, b);
 }
 
 // 公平 benchmark 基线：与 gemm_mma_forward 完全相同的输入/累加/输出语义。

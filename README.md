@@ -52,6 +52,30 @@ nvcc -O3 -I/home/eran/cutlass/include kernels/gemm_v3_cutlass.cu -o benchmarks/g
 
 > 注：这是各个独立 `.cu` 程序的阶段性历史数据。当前跨实现对比统一使用 [`torch_ext/bench_ops.py`](torch_ext/bench_ops.py)：CUDA Event 计时、预热、交错多轮中位数，并保证 dtype、累加精度和输出 dtype 一致。不要把两种测量口径的数字混用。
 
+## 当前稳定接口与简历主线
+
+实验版本用于展示优化过程，项目使用方优先调用 PyTorch Extension 中的稳定入口：
+
+```python
+out = ai_infra_ops.gemm_mma_auto(a, b)
+attn = ai_infra_ops.flashattention_auto(q, k, v, causal=False)
+```
+
+`gemm_mma_auto` 使用 shape-aware 三层调度：小 token-batch 的完整 tile 选择 BK32 v10，其他形状选择更稳定的 v8，tail 或非对齐 storage 最终回退 v4。Transformer projection 形状由 [`torch_ext/bench_gemm_transformer.py`](torch_ext/bench_gemm_transformer.py) 复现。这个接口标志着 GEMM 主线从“实验 kernel”进入“可用算子 API”阶段。
+
+当前简历表述草稿：
+
+> 基于 CUDA C++/inline PTX 与 PyTorch Extension 开发高性能算子库，实现 GEMM、FlashAttention、Softmax、LayerNorm、RMSNorm；手写 `mma.sync`、`ldmatrix` 与 `cp.async` 流水，通过 Nsight Compute 将 GEMM LDSM bank conflict 从 5.03 亿降至 0，RTX 3060 Laptop 上 `4096³` FP16-input/FP32-output GEMM 相对初版加速约 2.4x、达到约 14 TFLOP/s，并实现 shape-aware fast-path/fallback 调度及完整边界、stream 正确性测试。
+
+FlashAttention 也已有第一版稳定入口：`head_dim=64` 路由到 v5，`head_dim=128`
+路由到 v6，其他维度明确报错。当前只完成了“按能力正确分派”，尚未宣称它是跨 shape
+的性能最优策略。
+
+距离项目正式收尾还剩两个里程碑：
+
+1. 固化一份最终 benchmark 表，覆盖 cubic GEMM、Transformer projection、FlashAttention full/causal，并记录测试环境和频率波动说明。
+2. 清理构建缓存问题、补充一键构建/测试命令，整理 commit/tag 后再把上面的数据写入正式简历。
+
 ## 调优实战记录（ncu 性能分析）
 
 **FlashAttention v2 causal mask 的"负优化"之谜**（2026-09-06）：
@@ -88,7 +112,7 @@ v3 把"一线程一行"改成"一 warp 一行"（FA2 的重划分思想），每
 
 **教训**：① occupancy、搬运量、算术强度是三角债，拉满一个可能拖累另一个，优化是找平衡点；② shared memory 列访问必查 bank conflict（步长是 32 倍数时全撞）；③ 发散分支里禁用跨 lane shuffle，会死锁。
 
-**GEMM v4-v8 手写 Tensor Core（`mma.sync` / `cp.async` / `ldmatrix`）**（2026-09-08/11）：
+**GEMM v4-v10 手写 Tensor Core（`mma.sync` / `cp.async` / `ldmatrix`）**（2026-09-08/12）：
 
 v2 的 fp32 FMA 版在 1024³ 是 789 GFLOPS；v4 换成手写 `mma.sync.aligned.m16n8k16.row.col` 后约 5.5–5.8 TFLOP/s。继续加入 16-byte 对齐 fast path 和 `cp.async` 双缓冲后，v6 达到约 8.3–8.9 TFLOP/s，相对 v4 提升 1.49–1.59x。相同 fp16 输入、fp32 累加、fp32 输出的 cuBLAS 为 12.6–22.0 TFLOP/s。核心差异：FMA 是「每周期 32 个 lane 各 1 次乘加」，mma 是「每条指令整个 warp 算完 16×8×16=2048 次乘加」。
 
@@ -107,6 +131,12 @@ v2 的 fp32 FMA 版在 1024³ 是 789 GFLOPS；v4 换成手写 `mma.sync.aligned
 **性能解释**：2048 比 1024 慢 **8 倍**是健康的线性扩展（工作量 2·M·N·K ∝ D³），判断标准看 **TFLOP/s 是否持平**。v6 在三个尺寸均约 8.3–8.9 TFLOP/s，说明扩展正常；cuBLAS 在大尺寸升至约 22 TFLOP/s，则说明小尺寸尚未充分摊薄固定开销并填满硬件。若手写与 cuBLAS 在同一进程中同时按比例变慢，才更像笔记本 GPU 的频率/TDP 波动。
 
 v7 在相同 `64×64×16` tile 上把标量 fragment load 换成 warp 级 `ldmatrix`，但 `4096³` 仍约 18.01 ms。NCU 显示 5.03 亿次 LDSM bank conflict：A/B 原行跨度分别为 32/128 bytes，映射到 32 个 4-byte bank 后周期性重叠。v8 给每行增加 8 个 half，使跨度变成 48/144 bytes；8 行的 16-byte 段恰好落到互不重叠的 bank 区间。冲突降到 0，`4096³` 降至 11.06 ms（12.43 TFLOP/s），相对 v7 提速 1.63x、达到同轮同语义 cuBLAS 的约 66%。这里的关键不是“换了一条高级指令”，而是指令要求与 shared-memory layout 必须共同设计。
+
+v9 将 v8 的 layout 与 v6 的 `cp.async` 双缓冲组合，但在当前 `BK=16`、`64×64` tile 下没有继续提速：`4096³` 为 10.1097 ms，相比 v8 的 9.9003 ms 慢 2.1%；`2048³` 慢 11.6%。NCU 显示 v9 的 shared memory 从 5.38 KB 增至 10.75 KB，registers/thread 仍为 48，occupancy 仍由寄存器限制；主要原因是每个 tile 的 MMA 计算窗口太短，不足以覆盖 `commit/wait/barrier` 开销。这个负实验明确了下一步应扩大预取后的计算量，而不是盲目增加 pipeline stage。
+
+v10 在独立文件中把 `BK=16` 改为 `BK=32`，每次 stage 搬入 `64×32` 的 A tile 和 `32×64` 的 B tile，并连续执行两个 `ldmatrix + mma.sync` K-slice。`4096³` 达到 9.6866 ms，比 v8 快约 1.0%；但 `2048³` 为 1.2295 ms，比 v8 慢约 26.9%。这说明增加计算窗口确实可能让大矩阵受益，但 shared memory 从 5.38 KB 增至 19.46 KB，单一 BK 配置不能覆盖所有尺寸。
+
+生产入口 `gemm_mma_auto` 将版本链收敛为 shape-aware dispatch：`M<=256` 且满足完整 BK32 tile/16B 对齐时使用 v10，其余调用 v8，并由 v8 对 tail/非对齐输入回退 v4。规则刻意保守，因为 RTX 3060 Laptop 的频率状态会让边界形状结果反转；dispatch 的目标是稳定 API 和安全回退，不是用一次 benchmark 过拟合所有尺寸。
 
 **测量口径差异（重要）**：首轮含 CUDA context、库初始化、冷缓存和未稳态频率，不能作为 kernel 稳态性能。统一脚本先预热，再用 CUDA Event 测当前 stream 上的 GPU 时间，交错多轮取中位数；GEMM 版本链由 [`torch_ext/bench_gemm_mma.py`](torch_ext/bench_gemm_mma.py) 复现。尤其不能直接拿 `gemm_mma` 与 `torch.matmul(fp16)` 比：前者输出 fp32，后者输出 fp16。扩展中的 `gemm_cublas_fp32` 明确调用 `cublasGemmEx`，把输入、累加和输出语义完全对齐。
 
@@ -130,7 +160,7 @@ v4 在 QK MMA 和 online softmax 后，把寄存器中的概率写入 `Ps[64][65
 - **gemm_v1**: Shared Memory 分块（TILE=32），`As[ty][k] * Bs[k][tx]` 的访问模式天然无 Bank Conflict（源码注释里附了冲突反例对比）。相对 v0 加速 ~1.3x。
 - **gemm_v2**: 在 v1 已合并访存的基础上，全局加载改用 `__ldg` 走只读缓存 + `__restrict__`。
 - **gemm_v3_cutlass**: 调用 NVIDIA CUTLASS 库的 `cutlass::gemm::device::Gemm`，编译期固化 tile/warp/流水线配置，几乎零运行时开销；相比手写 v2 提速 ~6.5x，展示了工业级库与手写 kernel 的差距。
-- **gemm_v4-v8**: v4 手写 `mma.sync` 与 fragment；v5 增加对齐 16-byte 搬运 fast path；v6 使用 `cp.async` 双缓冲；v7 用 `ldmatrix` 暴露 shared-memory bank conflict；v8 通过 A/B 行 padding 将 LDSM 冲突从 5.03 亿降到 0。`4096³` 从 v4 的 26.88 ms 降至 v8 的 11.06 ms，形成“单变量修改—benchmark—NCU—layout 推导—再验证”的完整优化链。
+- **gemm_v4-v10 + auto**: v4 手写 `mma.sync` 与 fragment；v5 增加 16-byte fast path；v6 使用 `cp.async`；v7/v8 完成 `ldmatrix` bank-conflict 定位与 padding；v9/v10验证流水窗口；最终由 `gemm_mma_auto` 提供 v10/v8/v4 三层稳定调度。实验版本保留证据链，业务入口不暴露版本选择负担。
 - **softmax_v1**: 数值安全版（减 max）fused softmax；线程粗化（grid-stride）预扫描 + block 内树形归约到 32 个线程后改用 `__shfl_down_sync` warp 内归约，避免 `__syncthreads` 开销。
 - **layernorm_v1**: 一行一 block，线程粗化加载，两次归约（sum → 均值，平方和 → 方差），`rsqrtf(var+eps)` 归一化。
 - **rmsnorm_v1**: LLaMA/Qwen 标配的 RMSNorm。相比 LayerNorm 去掉 centering（减均值），只需一次归约（Σx²），且省一次全局显存读写。

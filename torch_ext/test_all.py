@@ -54,6 +54,7 @@ gemm_mma_shapes = (
     (65, 17, 33),
     (127, 129, 131),
     (128, 80, 192),  # vec/async 的 16-byte 对齐 fast path
+    (128, 64, 192),  # v10 的完整 64x64x32 fast path
 )
 max_gemm_mma_err = 0.0
 for m, k_dim, n in gemm_mma_shapes:
@@ -64,6 +65,9 @@ for m, k_dim, n in gemm_mma_shapes:
     async_out = ai_infra_ops.gemm_mma_async(a16, b16)
     ldmatrix_out = ai_infra_ops.gemm_mma_ldmatrix(a16, b16)
     ldmatrix_padded_out = ai_infra_ops.gemm_mma_ldmatrix_padded(a16, b16)
+    ldmatrix_async_padded_out = ai_infra_ops.gemm_mma_ldmatrix_async_padded(a16, b16)
+    v10_out = ai_infra_ops.gemm_mma_v10(a16, b16)
+    auto_out = ai_infra_ops.gemm_mma_auto(a16, b16)
     cublas_out = ai_infra_ops.gemm_cublas_fp32(a16, b16)
     ref = a16.float() @ b16.float()
     max_gemm_mma_err = max(
@@ -75,6 +79,9 @@ for m, k_dim, n in gemm_mma_shapes:
     torch.testing.assert_close(async_out, ref, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(ldmatrix_out, ref, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(ldmatrix_padded_out, ref, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(ldmatrix_async_padded_out, ref, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(v10_out, ref, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(auto_out, ref, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(cublas_out, ref, rtol=2e-2, atol=2e-2)
 
 print(f"[GEMM MMA edge suite] PASS  maxErr={max_gemm_mma_err:.3e}")
@@ -100,6 +107,24 @@ torch.testing.assert_close(
     rtol=2e-2,
     atol=2e-2,
 )
+torch.testing.assert_close(
+    ai_infra_ops.gemm_mma_ldmatrix_async_padded(offset_a, offset_b),
+    offset_ref,
+    rtol=2e-2,
+    atol=2e-2,
+)
+torch.testing.assert_close(
+    ai_infra_ops.gemm_mma_v10(offset_a, offset_b),
+    offset_ref,
+    rtol=2e-2,
+    atol=2e-2,
+)
+torch.testing.assert_close(
+    ai_infra_ops.gemm_mma_auto(offset_a, offset_b),
+    offset_ref,
+    rtol=2e-2,
+    atol=2e-2,
+)
 print("[GEMM MMA misaligned-storage fallback] PASS")
 
 # 确定性 fragment 映射测试：A 的每一行只选择 B 的一行。
@@ -109,9 +134,27 @@ map_rows = torch.arange(64, device=device)
 map_a[map_rows, map_rows % 16] = 1
 map_b = ((torch.arange(16 * 64, device=device) % 31) - 15).view(16, 64).half() / 16
 map_ref = map_a.float() @ map_b.float()
-for op in (ai_infra_ops.gemm_mma_ldmatrix, ai_infra_ops.gemm_mma_ldmatrix_padded):
+for op in (
+    ai_infra_ops.gemm_mma_ldmatrix,
+    ai_infra_ops.gemm_mma_ldmatrix_padded,
+    ai_infra_ops.gemm_mma_ldmatrix_async_padded,
+):
     torch.testing.assert_close(op(map_a, map_b), map_ref, rtol=0, atol=0)
 print("[GEMM MMA ldmatrix deterministic mapping] PASS")
+
+# v10 使用 BK=32，因此单独构造 64x32 @ 32x64 的确定性输入，
+# 验证两个连续 K-slice 的 ldmatrix 顺序没有交换或漏算。
+map_a_v10 = torch.zeros(64, 32, device=device, dtype=torch.float16)
+map_a_v10[map_rows, map_rows % 32] = 1
+map_b_v10 = ((torch.arange(32 * 64, device=device) % 37) - 18).view(32, 64).half() / 16
+map_ref_v10 = map_a_v10.float() @ map_b_v10.float()
+torch.testing.assert_close(
+    ai_infra_ops.gemm_mma_v10(map_a_v10, map_b_v10),
+    map_ref_v10,
+    rtol=0,
+    atol=0,
+)
+print("[GEMM MMA v10 BK32 deterministic mapping] PASS")
 
 # ---------------- FlashAttention（v3：N=8192 D=64） ----------------
 N2 = 8192
@@ -205,10 +248,17 @@ kb = torch.randn_like(qb)
 vb = torch.randn_like(qb)
 for causal in (False, True):
     out = ai_infra_ops.flashattention_v5(qb, kb, vb, causal)
+    auto_out = ai_infra_ops.flashattention_auto(qb, kb, vb, causal)
     ref = F.scaled_dot_product_attention(qb, kb, vb, is_causal=causal)
     check(
         f"FlashAttention v5 BHD {'causal' if causal else 'full'}",
         out.float(),
+        ref.float(),
+        2e-2,
+    )
+    check(
+        f"FlashAttention auto D64 {'causal' if causal else 'full'}",
+        auto_out.float(),
         ref.float(),
         2e-2,
     )
@@ -221,10 +271,17 @@ k128 = torch.randn_like(q128)
 v128 = torch.randn_like(q128)
 for causal in (False, True):
     out = ai_infra_ops.flashattention_v6(q128, k128, v128, causal)
+    auto_out = ai_infra_ops.flashattention_auto(q128, k128, v128, causal)
     ref = F.scaled_dot_product_attention(q128, k128, v128, is_causal=causal)
     check(
         f"FlashAttention v6 D128 {'causal' if causal else 'full'}",
         out.float(),
+        ref.float(),
+        3e-2,
+    )
+    check(
+        f"FlashAttention auto D128 {'causal' if causal else 'full'}",
+        auto_out.float(),
         ref.float(),
         3e-2,
     )
@@ -269,6 +326,14 @@ with torch.cuda.stream(test_stream):
     gemm_ldmatrix_padded_out = ai_infra_ops.gemm_mma_ldmatrix_padded(
         pipeline_a, pipeline_b
     )
+    gemm_ldmatrix_async_padded_out = ai_infra_ops.gemm_mma_ldmatrix_async_padded(
+        pipeline_a, pipeline_b
+    )
+    pipeline_a_v10 = torch.randn(64, 32, device=device, dtype=torch.float16)
+    pipeline_b_v10 = torch.randn(32, 64, device=device, dtype=torch.float16)
+    gemm_v10_out = ai_infra_ops.gemm_mma_v10(pipeline_a_v10, pipeline_b_v10)
+    gemm_auto_out = ai_infra_ops.gemm_mma_auto(pipeline_a_v10, pipeline_b_v10)
+    gemm_v10_ref = pipeline_a_v10.float() @ pipeline_b_v10.float()
     gemm_async_ref = pipeline_a.float() @ pipeline_b.float()
 
     sq = torch.randn(65, 64, device=device)
@@ -290,6 +355,14 @@ check(
     gemm_async_ref,
     2e-2,
 )
+check(
+    "GEMM MMA async+ldmatrix+padded non-default stream",
+    gemm_ldmatrix_async_padded_out,
+    gemm_async_ref,
+    2e-2,
+)
+check("GEMM MMA v10 BK32 non-default stream", gemm_v10_out, gemm_v10_ref, 2e-2)
+check("GEMM MMA auto non-default stream", gemm_auto_out, gemm_v10_ref, 2e-2)
 check("cuBLAS baseline non-default stream", gemm_cublas_out, gemm_mma_ref, 2e-2)
 check("FlashAttention v3 non-default stream", flash_out, flash_ref, 1e-2)
 

@@ -161,6 +161,9 @@ def main():
                 ("v6 async", lambda a=a16, b=b16: ai_infra_ops.gemm_mma_async(a, b)),
                 ("v7 ldmatrix", lambda a=a16, b=b16: ai_infra_ops.gemm_mma_ldmatrix(a, b)),
                 ("v8 ld+pad", lambda a=a16, b=b16: ai_infra_ops.gemm_mma_ldmatrix_padded(a, b)),
+                # v9 只作为组合实验保留；它是否优于 v8 需要看实际 tile 的计算窗口。
+                ("v9 async+ld+pad", lambda a=a16, b=b16: ai_infra_ops.gemm_mma_ldmatrix_async_padded(a, b)),
+                ("v10 BK32", lambda a=a16, b=b16: ai_infra_ops.gemm_mma_v10(a, b)),
                 ("cuBLAS", lambda a=a16, b=b16: ai_infra_ops.gemm_cublas_fp32(a, b)),
             ],
             warmup=max(5, args.warmup // 2),

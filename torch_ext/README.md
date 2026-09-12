@@ -1,6 +1,6 @@
 # torch_ext：把手写 CUDA kernel 封装成 PyTorch 算子
 
-把 `kernels/` 下 5 类手写 CUDA kernel（GEMM / Softmax / LayerNorm / RMSNorm / FlashAttention）统一封装成一个 PyTorch Extension 模块 `ai_infra_ops`。当前暴露 13 个手写算子入口，以及 1 个只用于公平测速的 cuBLAS 基线入口。
+把 `kernels/` 下 5 类手写 CUDA kernel（GEMM / Softmax / LayerNorm / RMSNorm / FlashAttention）统一封装成一个 PyTorch Extension 模块 `ai_infra_ops`。当前暴露 16 个手写算子/调度入口，以及 1 个只用于公平测速的 cuBLAS 基线入口。
 
 ## 环境
 
@@ -17,6 +17,8 @@ python3 -m venv ~/venvs/torch
 cd torch_ext
 export PATH=~/venvs/torch/bin:/usr/local/cuda/bin:$PATH
 export TORCH_CUDA_ARCH_LIST="8.6"   # RTX 3060 Laptop = Ampere sm_86
+# WSL 内存有限时避免 nvcc 并行编译多个大 CUDA TU 导致 OOM
+export MAX_JOBS=1
 ~/venvs/torch/bin/python setup.py build_ext --inplace
 ~/venvs/torch/bin/python test_all.py
 ~/venvs/torch/bin/python bench_ops.py
@@ -37,11 +39,15 @@ ai_infra_ops.gemm_mma_vec(a, b)          # GEMM v5：对齐 fast path + 16-byte 
 ai_infra_ops.gemm_mma_async(a, b)        # GEMM v6：cp.async + shared-memory 双缓冲
 ai_infra_ops.gemm_mma_ldmatrix(a, b)     # GEMM v7：ldmatrix 直接加载 fragment（冲突反例）
 ai_infra_ops.gemm_mma_ldmatrix_padded(a, b)  # GEMM v8：ldmatrix + 无冲突 padded layout
+ai_infra_ops.gemm_mma_ldmatrix_async_padded(a, b)  # GEMM v9：cp.async + ldmatrix + padding
+ai_infra_ops.gemm_mma_v10(a, b)            # GEMM v10：BK=32，两个 K-slice/async stage
+ai_infra_ops.gemm_mma_auto(a, b)           # 稳定入口：shape-aware v10/v8/v4 dispatch
 ai_infra_ops.gemm_cublas_fp32(a, b)      # 同语义 cuBLAS 基线，仅用于 benchmark
 ai_infra_ops.flashattention(q, k, v, causal)  # q/k/v [N,64] fp32
 ai_infra_ops.flashattention_fp16(q, k, v, causal)  # v4：fp16 Tensor Core，P 经 Ps 中转
 ai_infra_ops.flashattention_v5(q, k, v, causal)    # v5：[N,64] 或 [B,H,N,64]，P fragment 寄存器直连
 ai_infra_ops.flashattention_v6(q, k, v, causal)    # v6：[N,128] 或 [B,H,N,128]，D=128 实验版
+ai_infra_ops.flashattention_auto(q, k, v, causal)  # 稳定入口：按 D=64/128 路由 v5/v6
 ```
 
 ## 实测结果（RTX 3060 Laptop，`bench_ops.py` 复现）
@@ -52,9 +58,9 @@ ai_infra_ops.flashattention_v6(q, k, v, causal)    # v6：[N,128] 或 [B,H,N,128
 | Softmax fp32 `[1024,1024]` | 0.0298 ms | `torch.softmax` 0.0296 ms | 0.99x |
 | LayerNorm fp32 `[1024,1024]`（无 affine） | 0.0294 ms | `F.layer_norm` 0.0342 ms | 1.16x |
 | GEMM fp32 `1024³`（TF32 off） | 2.4011 ms / 0.89 TFLOP/s | cuBLAS 0.2971 ms / 7.23 TFLOP/s | 0.12x |
-| GEMM MMA v8 ldmatrix+padding `1024³`，fp32 输出 | 0.1192 ms / 18.02 TFLOP/s | cuBLAS 0.1748 ms / 12.29 TFLOP/s | 1.47x |
-| GEMM MMA v8 ldmatrix+padding `2048³`，fp32 输出 | 0.9803 ms / 17.52 TFLOP/s | cuBLAS 0.8705 ms / 19.74 TFLOP/s | 0.89x |
-| GEMM MMA v8 ldmatrix+padding `4096³`，fp32 输出 | 11.0606 ms / 12.43 TFLOP/s | cuBLAS 7.2913 ms / 18.85 TFLOP/s | 0.66x |
+| GEMM MMA v8 ldmatrix+padding `1024³`，fp32 输出 | 0.1209 ms / 17.76 TFLOP/s | cuBLAS 0.1779 ms / 12.07 TFLOP/s | 1.47x |
+| GEMM MMA v8 ldmatrix+padding `2048³`，fp32 输出 | 0.9964 ms / 17.24 TFLOP/s | cuBLAS 1.0273 ms / 16.72 TFLOP/s | 1.03x |
+| GEMM MMA v8 ldmatrix+padding `4096³`，fp32 输出 | 9.9003 ms / 13.88 TFLOP/s | cuBLAS 6.7062 ms / 20.49 TFLOP/s | 0.68x |
 | FlashAttention v5 D=64 | 0.4025 ms | PyTorch SDPA 0.1272 ms | 0.32x |
 | FlashAttention v6 D=128 | 0.8789 ms | PyTorch SDPA 0.2388 ms | 0.27x |
 
@@ -69,6 +75,7 @@ ai_infra_ops.flashattention_v6(q, k, v, causal)    # v6：[N,128] 或 [B,H,N,128
 - v6 async：保持 v5 的字节映射，只把 global→shared 改为 `cp.async` 双缓冲。
 - v7 ld：回到单缓冲同步复制，只把 shared→register 的标量 fragment load 替换为 warp 级 `ldmatrix`。这是故意保留的冲突反例。
 - v8 ld+pad：只把 A/B 的 shared-memory 行跨度分别从 16/64 half 改成 24/72 half，消除 `ldmatrix` bank conflict。
+- v9 async+ld+pad：在 v8 layout 上打开双缓冲 `cp.async`，验证 global→shared 预取是否能覆盖 MMA 和 `ldmatrix` 的执行时间。
 
 [`ldmatrix.sync.aligned.m8n8.x4.shared.b16`](https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-instructions-ldmatrix) 让整个 warp 合作加载四个 `8×8` fp16 子矩阵。A 的 `16×16` fragment 按 `(上左、下左、上右、下右)` 排列，恰好落到 MMA 的 `a0..a3`；B 在 shared memory 中按 `K×N` 行主序保存，使用 `.x2.trans` 将两个 `8×8` 子矩阵转置装入 `b0/b1`，匹配 `mma.sync...row.col` 的列主序 B fragment。所有 32 个 lane 必须一致执行 `.sync.aligned` 指令，且每个行首地址满足 16-byte 对齐；不能把它放进只有部分 lane 进入的分支。
 
@@ -90,11 +97,11 @@ Ampere shared memory 有 32 个 bank，每个 bank 宽 4 bytes，可用
 
 | Shape | v4 scalar | v5 vec | v6 async | v7 ld | v8 ld+pad | cuBLAS |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1024³ | 0.3968 ms | 0.2596 ms | 0.2479 ms | 0.2551 ms | **0.1192 ms** | 0.1748 ms |
-| 2048³ | 3.7219 ms | 2.4969 ms | 2.4127 ms | 2.4637 ms | **0.9803 ms** | 0.8705 ms |
-| 4096³ | 26.8825 ms | 18.6850 ms | 18.3289 ms | 18.0124 ms | **11.0606 ms** | 7.2913 ms |
+| 1024³ | 0.4075 ms | 0.2603 ms | 0.2534 ms | 0.2601 ms | **0.1209 ms** | 0.1779 ms |
+| 2048³ | 3.4137 ms | 2.1450 ms | 2.0779 ms | 2.0866 ms | **0.9964 ms** | 1.0273 ms |
+| 4096³ | 23.8806 ms | 16.5615 ms | 16.2755 ms | 16.2502 ms | **9.9003 ms** | 6.7062 ms |
 
-v7 在 4096³ 只有 7.63 TFLOP/s，说明减少 fragment 指令并不足以抵消冲突序列化；v8 在同一轮达到 12.43 TFLOP/s，相对 v7 提速 **1.63x**、相对 v4 提速 **2.43x**，达到该轮同语义 cuBLAS 的约 **66%**。2048³ 达到 cuBLAS 的约 89%；1024³ 在该轮快于此 cuBLAS 调用，但该结论受尺寸、算法选择与笔记本频率影响，不作普遍化宣传。
+v7 在 4096³ 只有 8.46 TFLOP/s，说明减少 fragment 指令并不足以抵消冲突序列化；v8 在同一轮达到 13.88 TFLOP/s，相对 v7 提速 **1.64x**、相对 v4 提速 **2.41x**，达到该轮同语义 cuBLAS 的约 **68%**。2048³ 略快于该轮 cuBLAS 调用；1024³ 也快于该轮 cuBLAS 调用，但这些结果受尺寸、算法选择与笔记本频率影响，不作普遍化宣传。
 
 ### GEMM MMA 的 NCU/SASS 证据
 
@@ -109,7 +116,99 @@ v7 在 4096³ 只有 7.63 TFLOP/s，说明减少 fragment 指令并不足以抵�
 
 反汇编可看到 `LDSM.16.M88.4`/`LDSM.16.MT88.2`，证明编译结果确实使用了 `ldmatrix`；v6 中则可看到 `LDGSTS.E.BYPASS.128`，对应 `cp.async`。NCU 的多 pass `Duration` 会受 replay 和采样时 GPU 频率影响，只用于解释瓶颈，最终速度采用 CUDA Event。这个阶段的完整证据链是：**fragment 指令开销假设 → v7 单变量修改 → benchmark 未改善 → NCU 发现 5 亿次 bank conflict → 按 bank 公式推导 padding → v8 冲突归零且提速 1.63x**。
 
-### 2026-09-11 实机验证记录
+### v9 组合实验：为什么双缓冲没有继续提速
+
+v9 只组合已经验证过的两个机制：v8 的无冲突 `ldmatrix` layout，以及 v6 的 `cp.async` 双缓冲。流水关系如下：
+
+```text
+stage 0: 计算当前 tile（ldmatrix + mma）
+stage 1: 同时接收下一个 tile 的 cp.async
+        ↓ wait_group 0 + __syncthreads
+交换 read_stage/write_stage
+```
+
+首个 tile 仍然必须 `commit → wait → __syncthreads`，因为它没有前一轮 MMA 可以用来覆盖加载延迟。后续每轮才预取到另一个 buffer；当前 `read_stage` 正被 `ldmatrix` 读取时，绝不能写回同一个 stage。源码中的阶段注释见 [gemm_mma_cuda.cu](/home/eran/cuda-kernels/torch_ext/csrc/gemm_mma_cuda.cu:288)。
+
+| Shape | v8 ld+pad | v9 async+ld+pad | v9 相对 v8 | cuBLAS |
+|---:|---:|---:|---:|---:|
+| 1024³ | 0.1209 ms | 0.1246 ms | -3.1% | 0.1779 ms |
+| 2048³ | 0.9964 ms | 1.1121 ms | -11.6% | 1.0273 ms |
+| 4096³ | 9.9003 ms | 10.1097 ms | -2.1% | 6.7062 ms |
+
+这个负结果同样重要。v9 的 static shared memory 从 5.38 KB 增至 10.75 KB，但 registers/thread 仍为 48，理论 occupancy 仍被寄存器限制在 83.33%，所以 shared memory 翻倍没有直接造成 occupancy 下降。当前真正的问题是 `BK=16` 时每个 tile 的计算窗口很短：每轮只有固定数量的 MMA，`cp.async.commit`、`wait_group` 和 block barrier 的额外成本没有被完全隐藏。v9 的 NCU 仍确认 `LDSM`/`LDGSTS` 均存在，但最终性能结论以交错 CUDA Event 为准。
+
+因此当前默认候选应保留 v8，v9 作为有实验价值的对照版本。要让异步流水真正获益，下一轮应扩大单次预取对应的计算量（例如更大的 `BK` 或每次加载后执行更多 MMA），同时重新检查寄存器压力，而不是继续无条件增加 pipeline stage。
+
+### v10：增大 BK，让一次预取覆盖两个 K-slice
+
+v10 将这个假设落实为独立文件 [gemm_mma_v10_cuda.cu](/home/eran/cuda-kernels/torch_ext/csrc/gemm_mma_v10_cuda.cu:1)。它把 `BK=16` 改为 `BK=32`，但 Tensor Core 的基本指令仍然是 `mma.sync.m16n8k16`，因此一个 `BK=32` tile 只是连续执行两个 K-slice：
+
+```text
+shared A/B tile: K = 32
+    ├── ldmatrix(A[k:k+16]) + ldmatrix(B[k:k+16]) + mma.sync
+    └── ldmatrix(A[k+16:k+32]) + ldmatrix(B[k+16:k+32]) + mma.sync
+```
+
+这一步的关键不是改变 MMA 的 fragment 形状，而是提高“每次 cp.async 预取后要做的计算量”。copy mapping 也必须重写：A 的 `64×32` tile 和 B 的 `32×64` tile 都是 4096B，256 个线程各搬 A、B 各一个 16B chunk。继续沿用 v9 的前 128 线程搬 A、后 128 线程搬 B 会少搬一半数据。
+
+padding 仍然不能删除：A stride 为 `40 half = 80B = 20 banks`，B stride 为 `72 half = 144B = 36 banks ≡ 4 (mod 32)`。两个 stride 都是 16B 的倍数，既满足 `cp.async`/`ldmatrix` 的对齐，也保持无冲突 layout。双缓冲的静态 shared memory 为：
+
+```text
+2 × (64×40 + 32×72) × sizeof(half) = 19,456 B
+```
+
+#### v10 实测结果
+
+同一脚本、同一输入、所有版本交错执行：
+
+```bash
+python bench_gemm_mma.py --sizes 4096 2048 1024 \
+  --warmup 30 --iters 20 --rounds 9
+```
+
+| Shape | v8 ld+pad | v9 async+ld+pad | v10 BK32 | cuBLAS |
+|---:|---:|---:|---:|---:|
+| 1024³ | 0.1228 ms | 0.1267 ms | **0.1160 ms** | 0.1817 ms |
+| 2048³ | **0.9690 ms** | 1.0870 ms | 1.2295 ms | 1.1177 ms |
+| 4096³ | 9.7819 ms | 10.2161 ms | **9.6866 ms** | 6.7538 ms |
+
+v10 在 4096³ 比 v8 快约 1.0%，在 1024³ 快约 5.5%，但在 2048³ 慢约 26.9%。因此目前不能把 v10 宣称为全面优于 v8；更准确的结论是：扩大 BK 确实让大矩阵的异步流水出现收益，但收益很小且对尺寸敏感。
+
+NCU 资源数据（4096³）：
+
+| 指标 | v8 | v10 |
+|---|---:|---:|
+| Registers/thread | 48 | 40 |
+| Static shared memory/block | 5.38 KB | 19.46 KB |
+| Theoretical occupancy | 83.33% | 83.33% |
+| Achieved occupancy | 82.39% | 82.29% |
+| Shared-memory block limit | 10 | 5 |
+
+v10 的寄存器数反而下降，但 shared memory block limit 从 10 降到 5；occupancy 暂时没有进一步下降，是因为 v8/v10 都已经受到其他资源约束。2048³ 的回退不能仅凭 occupancy 解释，还需要进一步观察 memory replay、L2 命中、kernel launch 频率和指令吞吐。因此下一步应做针对性 NCU 指标采集，而不是继续盲目增大 BK。
+
+### 稳定 GEMM 入口：shape-aware dispatch
+
+实验 API 用于保留学习证据，用户侧则应只依赖 `gemm_mma_auto(a, b)`。host-only 路由实现在 [gemm_dispatch.cpp](/home/eran/cuda-kernels/torch_ext/csrc/gemm_dispatch.cpp:1)，采用三层结构：
+
+```text
+M<=256，M/N 为 64 倍数，K 为 32 倍数，指针 16B 对齐
+    └── v10 BK32
+其他合法 fp16 GEMM
+    └── v8 ldmatrix+padding
+         └── 非完整 tile / 非对齐 storage 再回退 v4
+```
+
+该规则来自 Transformer 形状的多组交错复测，而不是只看 cubic GEMM。`M=128/256, K=N=4096` 时 v10 的多组中位数通常与 v8 持平或略快；`M=512` 的结果会随频率状态反转，因此策略刻意停在 `M<=256`。这里不做首调用现场 autotune，因为 CUDA Event 会强制同步并增加冷启动延迟；未来若扩展到多 GPU，可以在 Python 层建立 `(device, M, N, K)` policy cache。
+
+可用下面的脚本复现 projection/training 形状：
+
+```bash
+python bench_gemm_transformer.py --warmup 20 --iters 20 --rounds 7
+```
+
+一次 RTX 3060 Laptop 运行中，`[128,4096]@[4096,4096]` 的 auto/v8/v10 分别为 0.3109/0.3363/0.3158 ms；auto 与实际路由版本之间的微小差异来自交错顺序和 GPU 频率，不应解释成 dispatch 本身带来 kernel 加速。这个阶段的工程收益是统一 API、明确回退和真实模型形状验证。
+
+### 2026-09-12 实机验证记录
 
 本次在 RTX 3060 Laptop（sm_86，6GB）上重新编译并运行 `test_all.py`。PyTorch 为 `2.6.0+cu124`，CUDA Toolkit 为 `12.4`。WSL 的 `/usr/lib/wsl/lib` 已加入 `PATH`，`nvidia-smi` 与 PyTorch 均可识别 GPU：`torch.cuda.is_available() == True`、`device_count == 1`。
 
@@ -141,6 +240,9 @@ export TORCH_CUDA_ARCH_LIST="8.6"
 [FlashAttention v6 D128 full] PASS  maxErr=4.883e-04
 [FlashAttention v6 D128 causal] PASS  maxErr=2.441e-04
 [GEMM MMA ldmatrix+padded non-default stream] PASS  maxErr=2.861e-06
+[GEMM MMA async+ldmatrix+padded non-default stream] PASS  maxErr=2.861e-06
+[GEMM MMA v10 BK32 non-default stream] PASS  maxErr=5.722e-06
+[GEMM MMA auto non-default stream] PASS  maxErr=5.722e-06
 [PyTorch CUDA contract suite] PASS
 ```
 
@@ -163,14 +265,14 @@ V += sequence_offset;
 O += sequence_offset;
 ```
 
-每个 `(batch,head)` 的 softmax 状态完全独立，但所有 head 在同一次 kernel launch 中进入 GPU。使用 `B=2,H=8,N=1024,D=64`，交错 5 轮中位数结果：
+每个 `(batch,head)` 的 softmax 状态完全独立，但所有 head 在同一次 kernel launch 中进入 GPU。使用 `B=2,H=8,N=1024,D=64`，预热 20 次、每轮 50 次迭代并取交错 7 轮中位数：
 
-| 模式 | v5 BHD 单次 launch | Python 逐 head dispatch | PyTorch SDPA | dispatch/BHD |
-|---|---:|---:|---:|---:|
-| full | 0.7630 ms | 2.3754 ms | 0.2243 ms | **3.11x** |
-| causal | 0.4613 ms | 2.3670 ms | 0.1955 ms | **5.13x** |
+| 模式 | auto | v5 BHD | Python 逐 head | PyTorch SDPA | auto/v5 | 逐 head/v5 |
+|---|---:|---:|---:|---:|---:|---:|
+| full | 0.6583 ms | 0.6741 ms | 2.0552 ms | 0.1958 ms | 0.98x | **3.05x** |
+| causal | 0.3958 ms | 0.4010 ms | 2.0308 ms | 0.1321 ms | 0.99x | **5.06x** |
 
-二维 grid 消除了 16 次 Python/C++/CUDA launch 的串行提交开销，并把全部 head 的 Q block 一次性暴露给 GPU 调度器。与工业级 SDPA 仍有约 2.4–3.4x 差距，后续方向是支持更多 head dimension、减少手写 fragment load 指令并研究异步流水，而不是把该结果包装成“超过 PyTorch”。可用 `python bench_flashattention_bhd.py` 复现。
+`auto/v5≈1` 说明 head-dimension 调度不是当前瓶颈；二维 grid 消除了 16 次 Python/C++/CUDA launch 的串行提交开销，并把全部 head 的 Q block 一次性暴露给 GPU 调度器。v5 相对工业级 SDPA 仍慢约 3.0–3.4x，下一步应先 profile 内核，再决定优化 fragment load、K/V 搬运还是流水，而不是把该结果包装成“超过 PyTorch”。可用 `python bench_flashattention_bhd.py` 复现。
 
 ### v6：D=128 扩展实验
 
@@ -276,28 +378,32 @@ v4 的路径是 `S(fp32 registers) → fp16 Ps(smem) → half2 A registers → M
 - **归一化类必须与融合后的原生算子比较**：RMSNorm 对比 `F.rms_norm` 为 3.61x；LayerNorm 对比 `F.layer_norm` 只有 1.16x。旧的手写 eager 表达式会启动多个 kernel，不能代表 PyTorch 原生 LayerNorm。
 - **Softmax 0.97x 不丢人**：B=N=1024 时 torch.softmax 本身已是单个融合 kernel，打平合理；换非 2 的幂 N 或更大 batch，线程粗化版通常反超。
 - **GEMM 0.12x 是诚实的差距展示**：v2 tiled 手写 vs cuBLAS 差 9 倍——cuBLAS 用 Tensor Core + 深度流水线。这正是路线 B（FP16 + mma.sync）的动机，也是"知道轮子多快"和"会造轮子"都要会的证据。
-- **GEMM v8 达到 12.43–18.02 TFLOP/s**：v6 的 `cp.async` 单独只贡献约 4%–5%；v7 换成 `ldmatrix` 后也没有自然加速。NCU 定位到 5.03 亿次 LDSM bank conflict，再由 bank 公式推导行 padding，v8 将冲突清零并在 `4096³` 相对 v7 提速 1.63x。大尺寸达到同语义 cuBLAS 的约 66%，剩余差距要继续从 global→shared 与 shared→MMA 的组合流水、tile 计算密度和资源占用解决。
+- **GEMM v8/v10/auto**：v8 通过 bank 公式推导 padding，将 LDSM 冲突清零；v10 单独重写 `BK=32` copy mapping，让每次预取后执行两个 K-slice；`gemm_mma_auto` 再把实验实现收敛成 v10/v8/v4 三层调度。性能数字受笔记本频率影响，因此 dispatch 使用保守小 M 策略，不宣称某个 tile 全尺寸最优。
 
 ## 文件结构
 
 ```
 torch_ext/
 ├── csrc/
-│   ├── bindings.cpp           # PyBind11 绑定：13 个手写算子 + 1 个 cuBLAS 基线
+│   ├── bindings.cpp           # PyBind11 绑定：17 个手写算子/调度入口 + cuBLAS 基线
 │   ├── ops.h                  # 入口函数声明
 │   ├── rmsnorm_cuda.cu        # 各算子：CUDA kernel + torch::Tensor 包装
 │   ├── softmax_cuda.cu
 │   ├── layernorm_cuda.cu
 │   ├── gemm_cuda.cu
 │   ├── gemm_mma_cuda.cu       # GEMM v4-v8：mma/cp.async/ldmatrix/padding
+│   ├── gemm_mma_v10_cuda.cu   # GEMM v10：BK=32 双 K-slice 流水
+│   ├── gemm_dispatch.cpp       # 稳定 GEMM API：shape-aware v10/v8/v4
 │   ├── flashattention_cuda.cu       # FlashAttention v3，fp32 baseline
 │   ├── flashattention_mma_cuda.cu  # FlashAttention v4，fp16 Tensor Core + Ps
 │   ├── flashattention_v5_cuda.cu   # FlashAttention v5，P fragment 寄存器直连
-│   └── flashattention_v6_cuda.cu   # FlashAttention v6，D=128 实验版
+│   ├── flashattention_v6_cuda.cu   # FlashAttention v6，D=128 实验版
+│   └── flashattention_dispatch.cpp # 稳定入口：按 head dimension 路由 v5/v6
 ├── setup.py                   # CUDAExtension 单模块构建
 ├── test_all.py                # 全量正确性、边界与 CUDA stream 契约测试
 ├── bench_ops.py               # 统一同语义 benchmark（CUDA Event/交错/中位数）
-├── bench_gemm_mma.py          # GEMM v4-v8 + cuBLAS 受控版本链 benchmark
+├── bench_gemm_mma.py          # GEMM v4-v10 + cuBLAS 受控版本链 benchmark
+├── bench_gemm_transformer.py  # projection/training 真实形状 + auto dispatch
 ├── bench_avg.py               # 兼容旧入口，转到 bench_ops.py
 ├── bench_flashattention.py    # v3/v4/v5 交错、轮换顺序 benchmark
 ├── bench_flashattention_bhd.py # v5 BHD vs 逐 head dispatch vs PyTorch SDPA

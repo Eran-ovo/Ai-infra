@@ -19,6 +19,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "GEMM forward (CUDA, warp-level ldmatrix fragment loads)");
     m.def("gemm_mma_ldmatrix_padded", &gemm_mma_ldmatrix_padded_forward,
           "GEMM forward (CUDA, ldmatrix + padded shared-memory rows)");
+    m.def("gemm_mma_ldmatrix_async_padded", &gemm_mma_ldmatrix_async_padded_forward,
+          "GEMM forward (CUDA, cp.async + ldmatrix + padded shared-memory rows)");
+    m.def("gemm_mma_v10", &gemm_mma_v10_forward,
+          "GEMM v10 (CUDA, BK=32 cp.async + ldmatrix + padded layout)");
+    m.def("gemm_mma_auto", &gemm_mma_auto_forward,
+          "Production GEMM entry (CUDA, shape-aware v10/v8/v4 dispatch)");
     m.def("gemm_cublas_fp32", &gemm_cublas_fp32_forward,
           "GEMM baseline (cuBLAS, fp16 input/fp32 accumulation/fp32 output)");
     m.def("flashattention", &flashattention_forward, "FlashAttention forward (CUDA, online softmax)",
@@ -31,5 +37,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("q"), py::arg("k"), py::arg("v"), py::arg("causal") = false);
     m.def("flashattention_v6", &flashattention_v6_forward,
           "FlashAttention v6 forward (CUDA, fp16 Tensor Core, D=128)",
+          py::arg("q"), py::arg("k"), py::arg("v"), py::arg("causal") = false);
+    m.def("flashattention_auto", &flashattention_auto_forward,
+          "Stable FlashAttention entry (CUDA, dispatch by head dimension)",
           py::arg("q"), py::arg("k"), py::arg("v"), py::arg("causal") = false);
 }
