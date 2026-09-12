@@ -472,7 +472,7 @@ torch_ext/
 ├── test_all.py                # 全量正确性、边界与 CUDA stream 契约测试
 ├── bench_ops.py               # 统一同语义 benchmark（CUDA Event/交错/中位数）
 ├── bench_final.py             # 最终全套 benchmark，输出 JSON/CSV/Markdown
-├── benchmark_results/         # 带环境元数据、原始样本和摘要表的候选结果
+├── benchmark_results/         # 带环境元数据、原始样本和摘要表的正式结果
 ├── bench_gemm_mma.py          # GEMM v4-v10 + cuBLAS 受控版本链 benchmark
 ├── bench_gemm_transformer.py  # projection/training 真实形状 + auto dispatch
 ├── bench_avg.py               # 兼容旧入口，转到 bench_ops.py

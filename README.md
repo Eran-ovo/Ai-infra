@@ -81,10 +81,11 @@ GPU 架构和 Ninja，随后执行增量编译与完整正确性测试；同时�
 
 最终 benchmark 流程也已固化为 `torch_ext/bench_final.py`：使用 CUDA Event、
 位置/前序实现双重平衡顺序和多轮中位数，保存环境、每轮原始样本、MAD、
-极差、正确性误差及 TFLOP/s。当前实机候选报告见
+极差、正确性误差及 TFLOP/s。当前 sm_86 实机正式报告见
 [`final_benchmark_sm86.md`](torch_ext/benchmark_results/final_benchmark_sm86.md)。
-该候选是在 dirty worktree 上运行，因此距离正式收尾还剩一个版本化动作：
-审查并提交当前实现，在 clean commit 上复跑报告，然后提交结果并打 tag。
+该报告在 clean commit `1d2efa0` 上运行，元数据记录 `git_dirty=false`，原始
+样本同时保存为 JSON/CSV。至此第一版简历主线已经收尾，后续 kernel 迭代应
+建立在该版本基线上，不能用新的单次数据覆盖这份可复现结果。
 
 ## 调优实战记录（ncu 性能分析）
 

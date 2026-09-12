@@ -413,7 +413,8 @@ def write_reports(output_dir: Path, run_name: str, metadata: dict, rows: list[di
         "max_abs_error",
     ]
     with csv_path.open("w", newline="", encoding="utf-8") as csv_file:
-        writer = csv.DictWriter(csv_file, fieldnames=csv_fields)
+        # Git 仓库统一使用 LF；csv 模块默认 dialect 会写 CRLF。
+        writer = csv.DictWriter(csv_file, fieldnames=csv_fields, lineterminator="\n")
         writer.writeheader()
         for row in rows:
             writer.writerow({field: row[field] for field in csv_fields})
