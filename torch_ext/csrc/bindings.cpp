@@ -38,7 +38,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("flashattention_v6", &flashattention_v6_forward,
           "FlashAttention v6 forward (CUDA, fp16 Tensor Core, D=128)",
           py::arg("q"), py::arg("k"), py::arg("v"), py::arg("causal") = false);
+    m.def("flashattention_v7", &flashattention_v7_forward,
+          "FlashAttention v7 experiment (CUDA, D=64 register-cached Q fragments)",
+          py::arg("q"), py::arg("k"), py::arg("v"), py::arg("causal") = false);
     m.def("flashattention_auto", &flashattention_auto_forward,
-          "Stable FlashAttention entry (CUDA, dispatch by head dimension)",
+          "Stable FlashAttention entry (CUDA, dispatch by head dimension and sequence length)",
           py::arg("q"), py::arg("k"), py::arg("v"), py::arg("causal") = false);
 }

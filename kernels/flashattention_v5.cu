@@ -32,6 +32,13 @@
 #define WMMA_M 16
 #define WMMA_N 8
 
+// 默认仍编译原始 v5。v7 的 PyTorch wrapper 会在 include 本文件前改名 kernel，
+// 并打开 Q fragment 寄存器缓存。这样两版共享完全相同的 softmax/PV 代码，
+// 受控实验中唯一变量就是 Q 的数据通路。
+#ifndef FLASHATTENTION_V5_KERNEL
+#define FLASHATTENTION_V5_KERNEL flash_fp16_mma_v5
+#endif
+
 __device__ __forceinline__ unsigned as_u32(__half2 x) {
     return *reinterpret_cast<unsigned*>(&x);
 }
@@ -60,10 +67,10 @@ __device__ __forceinline__ void load_A_verified(__half2& a0, __half2& a1, __half
 }
 
 template<bool IS_CAUSAL>
-__global__ void flash_fp16_mma_v5(const __half* __restrict__ Q,
-                               const __half* __restrict__ K,
-                               const __half* __restrict__ V,
-                               __half* __restrict__ O, int N)
+__global__ void FLASHATTENTION_V5_KERNEL(const __half* __restrict__ Q,
+                                         const __half* __restrict__ K,
+                                         const __half* __restrict__ V,
+                                         __half* __restrict__ O, int N)
 {
     const int tid     = threadIdx.x;
     const int warp_id = tid / 32;      // 0..3，每个独占 16 行
@@ -83,8 +90,19 @@ __global__ void flash_fp16_mma_v5(const __half* __restrict__ Q,
     V += sequence_offset;
     O += sequence_offset;
 
+#ifdef FLASHATTENTION_V5_CACHE_Q_REGS
+    // v7：Q 只在初始化阶段使用。将其 fragment 缓存到寄存器后，同一块
+    // shared memory 就可以被后续 K tile 覆盖，省掉一个 64x65 half tile。
+    __shared__ __half QK_tile[Bq][D + 1];
+#define Q_TILE QK_tile
+#define K_TILE QK_tile
+#else
+    // v5：Q 与当前 K tile 必须同时存在，因此使用两块独立 shared memory。
     __shared__ __half Qs[Bq][D + 1];
     __shared__ __half Ks[Bc][D + 1];
+#define Q_TILE Qs
+#define K_TILE Ks
+#endif
     __shared__ __half Vs[Bc][D + 1];
 
     const int NT = WARPS * 32;   // 128
@@ -93,8 +111,25 @@ __global__ void flash_fp16_mma_v5(const __half* __restrict__ Q,
     for (int i = tid; i < Bq * D; i += NT) {
         int r = i / D, c = i % D;
         int gr = q_off + r;
-        Qs[r][c] = (gr < N) ? Q[gr * D + c] : __float2half(0.0f);
+        Q_TILE[r][c] = (gr < N) ? Q[gr * D + c] : __float2half(0.0f);
     }
+
+#ifdef FLASHATTENTION_V5_CACHE_Q_REGS
+    // 每个 lane 对一个 16x16 Q MMA tile 需要 4 个 half2 fragment；D=64
+    // 一共有 4 个 K-slice。先合作式加载 Q，随后每个 lane 一次性保存自己
+    // 后续所有 KV block 都会复用的 16 个 half2。
+    __half2 q_frag[D / BK][4];
+    __syncthreads();
+    #pragma unroll
+    for (int d0 = 0; d0 < D; d0 += BK) {
+        const int slice = d0 / BK;
+        load_A_verified(q_frag[slice][0], q_frag[slice][1],
+                        q_frag[slice][2], q_frag[slice][3],
+                        Q_TILE, ar, d0, g, gid);
+    }
+    // 必须确保所有 warp 都读完 Q，下一轮才能安全地用 K 覆盖 QK_tile。
+    __syncthreads();
+#endif
 
     // ---- 每 lane 的在线 softmax 状态：行 g 与行 g+8 ------------------------
     float m_prev[2] = {-1e20f, -1e20f};
@@ -120,7 +155,7 @@ __global__ void flash_fp16_mma_v5(const __half* __restrict__ Q,
         for (int i = tid; i < Bc * D; i += NT) {
             int r = i / D, c = i % D;
             int gr = k_off + r;
-            Ks[r][c] = (gr < N) ? K[gr * D + c] : __float2half(0.0f);
+            K_TILE[r][c] = (gr < N) ? K[gr * D + c] : __float2half(0.0f);
             Vs[r][c] = (gr < N) ? V[gr * D + c] : __float2half(0.0f);
         }
         __syncthreads();
@@ -136,13 +171,23 @@ __global__ void flash_fp16_mma_v5(const __half* __restrict__ Q,
         #pragma unroll
         for (int d0 = 0; d0 < D; d0 += BK) {
             __half2 a0, a1, a2, a3;
-            load_A_verified(a0, a1, a2, a3, Qs, ar, d0, g, gid);
+#ifdef FLASHATTENTION_V5_CACHE_Q_REGS
+            const int slice = d0 / BK;
+            a0 = q_frag[slice][0];
+            a1 = q_frag[slice][1];
+            a2 = q_frag[slice][2];
+            a3 = q_frag[slice][3];
+#else
+            load_A_verified(a0, a1, a2, a3, Q_TILE, ar, d0, g, gid);
+#endif
             #pragma unroll
             for (int t = 0; t < 8; ++t) {
                 int nc = t * WMMA_N;   // K 列（S 的输出列）
                 // B = K^T：K[j][d] -> Bop[d][j] = Ks[j][d]
-                __half2 b0 = __halves2half2(Ks[nc + g][d0 + gid * 2],     Ks[nc + g][d0 + gid * 2 + 1]);
-                __half2 b1 = __halves2half2(Ks[nc + g][d0 + gid * 2 + 8], Ks[nc + g][d0 + gid * 2 + 9]);
+                __half2 b0 = __halves2half2(K_TILE[nc + g][d0 + gid * 2],
+                                             K_TILE[nc + g][d0 + gid * 2 + 1]);
+                __half2 b1 = __halves2half2(K_TILE[nc + g][d0 + gid * 2 + 8],
+                                             K_TILE[nc + g][d0 + gid * 2 + 9]);
                 mma_m16n8k16(S[t][0], S[t][1], S[t][2], S[t][3], a0, a1, a2, a3, b0, b1);
             }
         }
@@ -292,6 +337,9 @@ __global__ void flash_fp16_mma_v5(const __half* __restrict__ Q,
     }
 }
 
+#undef Q_TILE
+#undef K_TILE
+
 // CPU 参考：fp32 输入（喂 fp16 量化后的数据），fp32 累加，减 max 稳定
 static void attn_cpu(const float* Q, const float* K, const float* V,
                      float* O, int N, bool causal) {
@@ -358,9 +406,9 @@ int main() {
 
             auto launch = [&]() {
                 if (causal)
-                    flash_fp16_mma_v5<true><<<grid, WARPS * 32>>>(dQ, dK, dV, dO, N);
+                    FLASHATTENTION_V5_KERNEL<true><<<grid, WARPS * 32>>>(dQ, dK, dV, dO, N);
                 else
-                    flash_fp16_mma_v5<false><<<grid, WARPS * 32>>>(dQ, dK, dV, dO, N);
+                    FLASHATTENTION_V5_KERNEL<false><<<grid, WARPS * 32>>>(dQ, dK, dV, dO, N);
             };
 
             launch();

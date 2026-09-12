@@ -20,11 +20,14 @@ setup(
                 "csrc/flashattention_mma_cuda.cu",  # FlashAttention v4（fp16 Tensor Core）
                 "csrc/flashattention_v5_cuda.cu",   # FlashAttention v5（P fragment 寄存器直连）
                 "csrc/flashattention_v6_cuda.cu",   # FlashAttention v6（D=128 实验版）
-                "csrc/flashattention_dispatch.cpp", # 稳定入口：按 head dimension 路由 v5/v6
+                "csrc/flashattention_v7_cuda.cu",   # FlashAttention v7（D=64 Q fragment 寄存器缓存）
+                "csrc/flashattention_dispatch.cpp", # 稳定入口：D64按N路由v5/v7，D128路由v6
             ],
             libraries=["cublas"],
             extra_compile_args={"cxx": ["-O3"], "nvcc": ["-O3"]},
         )
     ],
-    cmdclass={"build_ext": BuildExtension},
+    # 明确使用 Ninja 生成带依赖关系的增量构建；build_and_test.sh 会先
+    # 检查 ninja 是否真的位于 PATH，避免静默回退到 distutils 全量编译。
+    cmdclass={"build_ext": BuildExtension.with_options(use_ninja=True)},
 )

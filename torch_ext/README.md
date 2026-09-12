@@ -1,6 +1,6 @@
 # torch_ext：把手写 CUDA kernel 封装成 PyTorch 算子
 
-把 `kernels/` 下 5 类手写 CUDA kernel（GEMM / Softmax / LayerNorm / RMSNorm / FlashAttention）统一封装成一个 PyTorch Extension 模块 `ai_infra_ops`。当前暴露 16 个手写算子/调度入口，以及 1 个只用于公平测速的 cuBLAS 基线入口。
+把 `kernels/` 下 5 类手写 CUDA kernel（GEMM / Softmax / LayerNorm / RMSNorm / FlashAttention）统一封装成一个 PyTorch Extension 模块 `ai_infra_ops`。当前暴露 18 个手写算子/调度入口，以及 1 个只用于公平测速的 cuBLAS 基线入口。
 
 ## 环境
 
@@ -8,20 +8,46 @@
 # 隔离 venv（不污染系统 Python）
 python3 -m venv ~/venvs/torch
 ~/venvs/torch/bin/pip install torch --index-url https://download.pytorch.org/whl/cu124
-~/venvs/torch/bin/pip install numpy ninja
+# 固定已验证版本；Ninja 1.13.2 存在 .ninja_deps 损坏并重复全量编译的回归
+~/venvs/torch/bin/pip install numpy ninja==1.11.1.4
 ```
 
 ## 编译 & 运行
 
+推荐直接使用项目脚本。它会自动找到虚拟环境中的 Python/Ninja、检查
+CUDA GPU 与 `nvcc`、读取当前 GPU 的 compute capability，并默认使用
+`MAX_JOBS=1` 完成增量编译和完整正确性测试：
+
 ```bash
 cd torch_ext
-export PATH=~/venvs/torch/bin:/usr/local/cuda/bin:$PATH
-export TORCH_CUDA_ARCH_LIST="8.6"   # RTX 3060 Laptop = Ampere sm_86
-# WSL 内存有限时避免 nvcc 并行编译多个大 CUDA TU 导致 OOM
-export MAX_JOBS=1
-~/venvs/torch/bin/python setup.py build_ext --inplace
-~/venvs/torch/bin/python test_all.py
+./build_and_test.sh
+```
+
+如需使用其他 Python 或调整并行度，可在命令前覆盖环境变量：
+
+```bash
+AI_INFRA_PYTHON=/path/to/python MAX_JOBS=2 ./build_and_test.sh
+```
+
+编译完成后再按需运行性能测试（性能测试不放进默认脚本，避免每次改动后
+把正确性回归与受温度/功耗影响的 benchmark 混在一起）：
+
+```bash
 ~/venvs/torch/bin/python bench_ops.py
+```
+
+项目收尾时使用统一最终测试入口。默认覆盖归约算子、cubic/Transformer GEMM、
+FlashAttention D64/D128 的 full/causal，并输出带环境信息和原始样本的
+JSON、CSV、Markdown 到 `benchmark_results/`：
+
+```bash
+~/venvs/torch/bin/python bench_final.py
+```
+
+修改脚本后先用快速模式检查流程；快速模式迭代次数少，结果不能用于简历：
+
+```bash
+~/venvs/torch/bin/python bench_final.py --quick --warmup 2 --iters 3
 ```
 
 ## API
@@ -47,7 +73,8 @@ ai_infra_ops.flashattention(q, k, v, causal)  # q/k/v [N,64] fp32
 ai_infra_ops.flashattention_fp16(q, k, v, causal)  # v4：fp16 Tensor Core，P 经 Ps 中转
 ai_infra_ops.flashattention_v5(q, k, v, causal)    # v5：[N,64] 或 [B,H,N,64]，P fragment 寄存器直连
 ai_infra_ops.flashattention_v6(q, k, v, causal)    # v6：[N,128] 或 [B,H,N,128]，D=128 实验版
-ai_infra_ops.flashattention_auto(q, k, v, causal)  # 稳定入口：按 D=64/128 路由 v5/v6
+ai_infra_ops.flashattention_v7(q, k, v, causal)    # v7：D=64，Q fragment 寄存器缓存实验
+ai_infra_ops.flashattention_auto(q, k, v, causal)  # 稳定入口：D64按N路由v5/v7，D128路由v6
 ```
 
 ## 实测结果（RTX 3060 Laptop，`bench_ops.py` 复现）
@@ -265,14 +292,54 @@ V += sequence_offset;
 O += sequence_offset;
 ```
 
-每个 `(batch,head)` 的 softmax 状态完全独立，但所有 head 在同一次 kernel launch 中进入 GPU。使用 `B=2,H=8,N=1024,D=64`，预热 20 次、每轮 50 次迭代并取交错 7 轮中位数：
+每个 `(batch,head)` 的 softmax 状态完全独立，但所有 head 在同一次 kernel launch 中进入 GPU。使用 `B=2,H=8,N=1024,D=64`，预热 30 次、每轮 100 次迭代并取平衡顺序的 10 轮中位数：
 
-| 模式 | auto | v5 BHD | Python 逐 head | PyTorch SDPA | auto/v5 | 逐 head/v5 |
+| 模式 | auto | v5 BHD | v7 Q-reg | Python 逐 head | PyTorch SDPA | v7/v5 |
 |---|---:|---:|---:|---:|---:|---:|
-| full | 0.6583 ms | 0.6741 ms | 2.0552 ms | 0.1958 ms | 0.98x | **3.05x** |
-| causal | 0.3958 ms | 0.4010 ms | 2.0308 ms | 0.1321 ms | 0.99x | **5.06x** |
+| full | 0.6394 ms | 0.7227 ms | 0.6398 ms | 2.1435 ms | 0.2082 ms | **0.89x** |
+| causal | 0.4150 ms | 0.4552 ms | 0.4207 ms | 2.1429 ms | 0.1372 ms | **0.92x** |
 
-`auto/v5≈1` 说明 head-dimension 调度不是当前瓶颈；二维 grid 消除了 16 次 Python/C++/CUDA launch 的串行提交开销，并把全部 head 的 Q block 一次性暴露给 GPU 调度器。v5 相对工业级 SDPA 仍慢约 3.0–3.4x，下一步应先 profile 内核，再决定优化 fragment load、K/V 搬运还是流水，而不是把该结果包装成“超过 PyTorch”。可用 `python bench_flashattention_bhd.py` 复现。
+`auto` 在 N=1024 时路由到 v7，两者约 1% 的差异属于笔记本频率噪声；二维
+grid 消除了 16 次 Python/C++/CUDA launch 的串行提交开销，并把全部 head 的
+Q block 一次性暴露给 GPU 调度器。v7 在该 shape 上相对 v5 提速约
+1.13x/1.08x，但仍明显慢于工业级 SDPA。可用
+`python bench_flashattention_bhd.py --warmup 30 --iters 100 --rounds 10` 复现。
+
+对同一 full shape 做 Nsight Compute 定位：L1/TEX 利用率 88.73%，DRAM 利用率仅
+2.06%，warp 在 MIO queue full 上平均停顿 4.9 cycles（占 issue 间隔约 43.2%）。
+kernel 使用 99 registers/thread 和 24.96 KB shared memory/block；shared memory
+把每个 SM 限制为 3 blocks，理论/实测 occupancy 为 25%/22.92%。因此当前证据
+指向片上 shared-memory/MIO 压力，不支持“先优化全局显存带宽”的判断。可用
+`profile_flashattention_v5.py` 复现。v7 将 Q fragment 跨 KV block 缓存在寄存器，
+并让 Q/K 复用同一 shared tile：shared memory 降到 16.64 KB，寄存器升到
+127/thread（full），理论/实测 occupancy 提高到 33.33%/28.64%，NCU duration
+从 1.36 降至 1.19 ms。MIO stall 占比反而升到 58.4%，说明更高 occupancy
+改善了延迟隐藏，但片上 MIO 争用仍是后续瓶颈。经过 N 扫描和 B×H 扫描后，
+生产 `auto` 已仅在 D64、N>=1024 时切换到 v7。
+
+causal 对照 profile 使用同一 shape：v5 为 99 registers/thread、理论/实测
+occupancy 25%/22.59%、MIO stall 39.7%；v7 为137 registers/thread、
+25%/22.20%、MIO stall 52.5%。v7 causal 仍从 NCU duration 0.895 ms 降到
+0.777 ms，说明收益主要来自减少重复 Q shared loads 和提高计算吞吐，而不是
+occupancy 提升。下一步若继续优化 causal，应研究对角线 KV tile 中未来位置的
+无效 MMA/softmax 工作，不能直接套用 full 路径的 occupancy 结论。
+
+固定 `B=2,H=8,D=64` 后独立执行两次序列长度扫描，v7 相对 v5 的加速范围：
+
+| N | KV tiles | full speedup | causal speedup |
+|---:|---:|---:|---:|
+| 128 | 2 | 1.037–1.041x | 1.017–1.018x |
+| 256 | 4 | 1.020–1.214x | 1.029–1.032x |
+| 512 | 8 | 1.064–1.066x | 1.033–1.061x |
+| 1024 | 16 | 1.138–1.141x | 1.080–1.096x |
+| 2048 | 32 | 1.134–1.136x | 1.094–1.097x |
+| 4096 | 64 | 1.128x | 1.096–1.097x |
+
+`N=256 full` 的单次 1.214x 没有复现，不能作为调度依据。`N>=1024`
+的收益则跨两次运行较稳定，符合 Q fragment 复用次数增加、固定初始化成本被摊薄
+的预期。causal 平均只遍历约一半 KV tiles，因此收益小于 full。随后固定
+`N=1024` 扫描 `B*H={1,4,16,64}`，v7 在 full/causal 均保持正收益，因此生产
+策略采用 `D64 && N>=1024 -> v7`。
 
 ### v6：D=128 扩展实验
 
@@ -385,7 +452,7 @@ v4 的路径是 `S(fp32 registers) → fp16 Ps(smem) → half2 A registers → M
 ```
 torch_ext/
 ├── csrc/
-│   ├── bindings.cpp           # PyBind11 绑定：17 个手写算子/调度入口 + cuBLAS 基线
+│   ├── bindings.cpp           # PyBind11 绑定：18 个手写算子/调度入口 + cuBLAS 基线
 │   ├── ops.h                  # 入口函数声明
 │   ├── rmsnorm_cuda.cu        # 各算子：CUDA kernel + torch::Tensor 包装
 │   ├── softmax_cuda.cu
@@ -398,16 +465,23 @@ torch_ext/
 │   ├── flashattention_mma_cuda.cu  # FlashAttention v4，fp16 Tensor Core + Ps
 │   ├── flashattention_v5_cuda.cu   # FlashAttention v5，P fragment 寄存器直连
 │   ├── flashattention_v6_cuda.cu   # FlashAttention v6，D=128 实验版
-│   └── flashattention_dispatch.cpp # 稳定入口：按 head dimension 路由 v5/v6
+│   ├── flashattention_v7_cuda.cu   # FlashAttention v7，Q fragment 寄存器缓存
+│   └── flashattention_dispatch.cpp # 稳定入口：D64路由v5/v7，D128路由v6
 ├── setup.py                   # CUDAExtension 单模块构建
+├── build_and_test.sh          # 环境预检 + Ninja 增量编译 + 完整正确性测试
 ├── test_all.py                # 全量正确性、边界与 CUDA stream 契约测试
 ├── bench_ops.py               # 统一同语义 benchmark（CUDA Event/交错/中位数）
+├── bench_final.py             # 最终全套 benchmark，输出 JSON/CSV/Markdown
+├── benchmark_results/         # 带环境元数据、原始样本和摘要表的候选结果
 ├── bench_gemm_mma.py          # GEMM v4-v10 + cuBLAS 受控版本链 benchmark
 ├── bench_gemm_transformer.py  # projection/training 真实形状 + auto dispatch
 ├── bench_avg.py               # 兼容旧入口，转到 bench_ops.py
 ├── bench_flashattention.py    # v3/v4/v5 交错、轮换顺序 benchmark
 ├── bench_flashattention_bhd.py # v5 BHD vs 逐 head dispatch vs PyTorch SDPA
-└── bench_flashattention_d128.py # v6 D=128 vs PyTorch SDPA
+├── bench_flashattention_d128.py # v6 D=128 vs PyTorch SDPA
+├── bench_flashattention_v7.py # 固定 B/H/D，扫描 N 对比 v5/v7
+├── bench_flashattention_v7_bh.py # 固定 N/D，扫描 B×H 并行度
+└── profile_flashattention_v5.py # 单次暖机 launch，供 NCU 对比 v5/v7
 ```
 
 ## 关键点（面试常问）

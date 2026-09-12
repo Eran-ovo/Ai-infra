@@ -202,11 +202,12 @@ check("FlashAttention v5 full", out.float(), torch_attn_fp16(False).float(), 2e-
 out = ai_infra_ops.flashattention_v5(q16, k16, v16, True)
 check("FlashAttention v5 causal", out.float(), torch_attn_fp16(True).float(), 2e-2)
 
-# ---------------- FlashAttention v4/v5 边界回归 ----------------
+# ---------------- FlashAttention v4/v5/v7 边界回归 ----------------
 # 同时覆盖 Bq/Bc=64 的边界前、边界上、边界后以及多个 KV tile。
 edge_sizes = (1, 7, 63, 64, 65, 127, 128, 129, 257)
 max_edge_err = 0.0
 max_v4_v5_diff = 0.0
+max_v5_v7_diff = 0.0
 for n in edge_sizes:
     qe = torch.randn(n, 64, device=device, dtype=torch.float16)
     ke = torch.randn(n, 64, device=device, dtype=torch.float16)
@@ -222,23 +223,34 @@ for n in edge_sizes:
         ref = (torch.softmax(masked_scores, dim=-1) @ ve.float()).half()
         out4 = ai_infra_ops.flashattention_fp16(qe, ke, ve, causal)
         out5 = ai_infra_ops.flashattention_v5(qe, ke, ve, causal)
+        out7 = ai_infra_ops.flashattention_v7(qe, ke, ve, causal)
         max_edge_err = max(
             max_edge_err,
             (out4.float() - ref.float()).abs().max().item(),
             (out5.float() - ref.float()).abs().max().item(),
+            (out7.float() - ref.float()).abs().max().item(),
         )
         max_v4_v5_diff = max(
             max_v4_v5_diff,
             (out4.float() - out5.float()).abs().max().item(),
         )
+        max_v5_v7_diff = max(
+            max_v5_v7_diff,
+            (out5.float() - out7.float()).abs().max().item(),
+        )
 
-edge_ok = max_edge_err < 2e-2 and max_v4_v5_diff == 0.0
+edge_ok = (
+    max_edge_err < 2e-2
+    and max_v4_v5_diff == 0.0
+    and max_v5_v7_diff == 0.0
+)
 print(
-    f"[FlashAttention v4/v5 edge suite] {'PASS' if edge_ok else 'FAIL'}  "
-    f"maxErr={max_edge_err:.3e}  v4-v5={max_v4_v5_diff:.3e}"
+    f"[FlashAttention v4/v5/v7 edge suite] {'PASS' if edge_ok else 'FAIL'}  "
+    f"maxErr={max_edge_err:.3e}  v4-v5={max_v4_v5_diff:.3e}  "
+    f"v5-v7={max_v5_v7_diff:.3e}"
 )
 if not edge_ok:
-    raise AssertionError("FlashAttention v4/v5 edge regression failed")
+    raise AssertionError("FlashAttention v4/v5/v7 edge regression failed")
 
 # ---------------- FlashAttention v5 批量多头 [B,H,N,D] ----------------
 # N=65 同时覆盖多头寻址隔离和每个 head 内的 K/V tail。
@@ -248,11 +260,18 @@ kb = torch.randn_like(qb)
 vb = torch.randn_like(qb)
 for causal in (False, True):
     out = ai_infra_ops.flashattention_v5(qb, kb, vb, causal)
+    out_v7 = ai_infra_ops.flashattention_v7(qb, kb, vb, causal)
     auto_out = ai_infra_ops.flashattention_auto(qb, kb, vb, causal)
     ref = F.scaled_dot_product_attention(qb, kb, vb, is_causal=causal)
     check(
         f"FlashAttention v5 BHD {'causal' if causal else 'full'}",
         out.float(),
+        ref.float(),
+        2e-2,
+    )
+    check(
+        f"FlashAttention v7 BHD {'causal' if causal else 'full'}",
+        out_v7.float(),
         ref.float(),
         2e-2,
     )

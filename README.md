@@ -49,6 +49,7 @@ nvcc -O3 -I/home/eran/cutlass/include kernels/gemm_v3_cutlass.cu -o benchmarks/g
 | FlashAttention | v4（fp16 Tensor Core，P 经 shared-memory `Ps` 中转） | N=8192, D=64 | full 4.2508 / causal 2.4759 ms | - | PASS (N=129 tail maxErr=9.8e-04) |
 | FlashAttention | v5（v4 + P fragment 寄存器直连） | N=8192, D=64 | full 3.3810 / causal 2.1193 ms | v4/v5=1.26x/1.17x | PASS (与 v4 误差相同) |
 | FlashAttention | v6（v5 + D=128） | B=2,H=2,N=4096,D=128 | full 7.3629 / causal 3.5975 ms | vs SDPA 3.95x/3.57x | PASS |
+| FlashAttention | v7（D=64，Q fragment 寄存器缓存 + Q/K smem 复用） | B=2,H=8,N=1024,D=64 | full 0.6500 / causal 0.4254 ms | vs v5 1.13x/1.09x | PASS (v5/v7 逐元素相同) |
 
 > 注：这是各个独立 `.cu` 程序的阶段性历史数据。当前跨实现对比统一使用 [`torch_ext/bench_ops.py`](torch_ext/bench_ops.py)：CUDA Event 计时、预热、交错多轮中位数，并保证 dtype、累加精度和输出 dtype 一致。不要把两种测量口径的数字混用。
 
@@ -66,15 +67,24 @@ attn = ai_infra_ops.flashattention_auto(q, k, v, causal=False)
 当前简历表述草稿：
 
 > 基于 CUDA C++/inline PTX 与 PyTorch Extension 开发高性能算子库，实现 GEMM、FlashAttention、Softmax、LayerNorm、RMSNorm；手写 `mma.sync`、`ldmatrix` 与 `cp.async` 流水，通过 Nsight Compute 将 GEMM LDSM bank conflict 从 5.03 亿降至 0，RTX 3060 Laptop 上 `4096³` FP16-input/FP32-output GEMM 相对初版加速约 2.4x、达到约 14 TFLOP/s，并实现 shape-aware fast-path/fallback 调度及完整边界、stream 正确性测试。
+>
+> 使用 Nsight Compute 定位 FlashAttention 的 shared-memory/MIO 压力，通过寄存器缓存 Q MMA fragment 并复用 Q/K shared tile，将 shared memory 从 24.96 KB 降至 16.64 KB、实测 occupancy 从 22.92% 提升至 28.64%，在 D64、N>=1024 的多组 B×H shape 上相对基线加速约 1.1x–1.14x，并实现 D64/D128 稳定调度。
 
-FlashAttention 也已有第一版稳定入口：`head_dim=64` 路由到 v5，`head_dim=128`
-路由到 v6，其他维度明确报错。当前只完成了“按能力正确分派”，尚未宣称它是跨 shape
-的性能最优策略。
+FlashAttention 也已有第一版稳定入口：`head_dim=64` 且 `N>=1024` 路由到 v7，
+较短 D64 路由到 v5，`head_dim=128` 路由到 v6，其他维度明确报错。D64 阈值来自
+固定 N 扫描和固定 N 的 B×H 扫描，仍需在更多真实模型 shape 上继续验证。
 
-距离项目正式收尾还剩两个里程碑：
+构建工程化里程碑已完成：`torch_ext/build_and_test.sh` 会检查 Python、CUDA、
+GPU 架构和 Ninja，随后执行增量编译与完整正确性测试；同时固定 Ninja
+`1.11.1.4`，规避 1.13.2 损坏 `.ninja_deps` 并重复全量编译的已知回归。
+连续两次实机验证中，第二次构建已达到 `ninja: no work to do.`。
 
-1. 固化一份最终 benchmark 表，覆盖 cubic GEMM、Transformer projection、FlashAttention full/causal，并记录测试环境和频率波动说明。
-2. 清理构建缓存问题、补充一键构建/测试命令，整理 commit/tag 后再把上面的数据写入正式简历。
+最终 benchmark 流程也已固化为 `torch_ext/bench_final.py`：使用 CUDA Event、
+位置/前序实现双重平衡顺序和多轮中位数，保存环境、每轮原始样本、MAD、
+极差、正确性误差及 TFLOP/s。当前实机候选报告见
+[`final_benchmark_sm86.md`](torch_ext/benchmark_results/final_benchmark_sm86.md)。
+该候选是在 dirty worktree 上运行，因此距离正式收尾还剩一个版本化动作：
+审查并提交当前实现，在 clean commit 上复跑报告，然后提交结果并打 tag。
 
 ## 调优实战记录（ncu 性能分析）
 
@@ -171,3 +181,4 @@ v4 在 QK MMA 和 online softmax 后，把寄存器中的概率写入 `Ps[64][65
 - **flashattention_v5**: 复用 QK 输出 fragment 的寄存器布局，把相邻两个 `16×8` 的 P tile 直接拼成 PV 的 `16×16` A fragment，删除 `Ps` 中转。shared memory 33.28→24.96 KB，理论 occupancy 16.67%→25%（实测 15.55%→21.28%），N=8192 full/causal 相对 v4 提速 1.26x/1.17x。
 - **flashattention_v5 BHD**: 同一 kernel 兼容 `[N,64]` 和连续 `[B,H,N,64]`；`grid.x` 枚举 Q block，`grid.y` 枚举展平的 batch×head。B=2/H=8/N=1024 时，一次 BHD launch 相比 Python 逐 head dispatch 在 full/causal 分别快 3.11x/5.13x，并与 PyTorch SDPA 完成正确性对拍。
 - **flashattention_v6**: 独立 D=128 实验版。QK 归约步数 4→8、PV 输出 tile 8→16、shared memory 24.96→49.54 KB；full 128 registers/thread、causal 163 registers/thread，仍无 spill，说明下一瓶颈是寄存器生命周期和 tile 设计。
+- **flashattention_v7**: D=64 优化版。Q 先合作式进入 shared memory，再将每个 lane 的 MMA fragment 缓存到寄存器，使 Q/K 复用同一 tile；shared memory 24.96→16.64 KB，实测 occupancy 22.92%→28.64%，固定 BHD shape 的 full/causal 相对 v5 提速 1.13x/1.09x。完成 N 与 B×H 扫描后，生产 `auto` 在 D64、N>=1024 时选择 v7。

@@ -35,11 +35,18 @@ def bench_many(functions, warmup, iters, rounds):
             fn()
     torch.cuda.synchronize()
 
+    # 5 个实现使用 5 条 Williams Latin-square 序列及其逆序。这样每个
+    # 实现既会等次数访问每个位置，也会均衡跟随其他实现，避免固定前序
+    # workload 对笔记本 GPU 动态频率造成系统性偏差。
+    base_orders = [
+        tuple((value + shift) % 5 for value in (0, 1, 4, 2, 3))
+        for shift in range(5)
+    ]
+    balanced_orders = base_orders + [tuple(reversed(order)) for order in base_orders]
+
     samples = [[] for _ in functions]
     for round_id in range(rounds):
-        # 每轮旋转执行顺序，避免总让同一个实现处在较冷或较热的 GPU 状态。
-        # 最后取中位数，降低偶发系统调度和笔记本功耗波动的影响。
-        for index in ((round_id + i) % len(functions) for i in range(len(functions))):
+        for index in balanced_orders[round_id % len(balanced_orders)]:
             samples[index].append(measure_cuda(functions[index], iters))
     return [median(values) for values in samples]
 
@@ -50,8 +57,16 @@ parser.add_argument("--heads", type=int, default=8)
 parser.add_argument("--n", type=int, default=1024)
 parser.add_argument("--warmup", type=int, default=20)
 parser.add_argument("--iters", type=int, default=50)
-parser.add_argument("--rounds", type=int, default=5)
+parser.add_argument(
+    "--rounds",
+    type=int,
+    default=10,
+    help="use a multiple of 10 to balance position and predecessor workload",
+)
 args = parser.parse_args()
+
+if args.rounds <= 0 or args.rounds % 10 != 0:
+    parser.error("--rounds must be a positive multiple of 10")
 
 torch.manual_seed(42)
 device = "cuda"
@@ -72,25 +87,28 @@ def per_head_dispatch(causal):
 
 
 print(
-    "B,H,N,mode,auto_ms,v5_bhd_ms,per_head_dispatch_ms,torch_sdpa_ms,"
-    "auto_over_v5,per_head_over_v5,v5_over_sdpa"
+    "B,H,N,mode,auto_ms,v5_bhd_ms,v7_qreg_ms,per_head_dispatch_ms,"
+    "torch_sdpa_ms,auto_over_v5,v7_over_v5,per_head_over_v5,v5_over_sdpa"
 )
 for causal in (False, True):
-    # auto(D=64) 最终会调用同一个 v5 CUDA kernel。二者的差值主要衡量一层
-    # host-side head_dim 判断的开销；若出现几个百分点的反转，应先考虑 GPU
-    # boost/温度与测量噪声，不能误认为 auto 改变了 kernel 性能。
+    # auto(D=64) 在 N<1024 时调用 v5，在 N>=1024 时调用 v7。它与实际
+    # 路由版本的差值只来自 host dispatch 和测量噪声，不是另一种 kernel。
     functions = [
         lambda c=causal: ai_infra_ops.flashattention_auto(q, k, v, c),
         lambda c=causal: ai_infra_ops.flashattention_v5(q, k, v, c),
+        # v7 与 v5 的数学路径相同，只把 Q fragment 跨 KV block 缓存在寄存器，
+        # 并让 Q/K 共用一块 shared-memory tile。
+        lambda c=causal: ai_infra_ops.flashattention_v7(q, k, v, c),
         lambda c=causal: per_head_dispatch(c),
         lambda c=causal: F.scaled_dot_product_attention(q, k, v, is_causal=c),
     ]
-    t_auto, t_bhd, t_dispatch, t_sdpa = bench_many(
+    t_auto, t_bhd, t_v7, t_dispatch, t_sdpa = bench_many(
         functions, args.warmup, args.iters, args.rounds
     )
     print(
         f"{args.batch},{args.heads},{args.n},"
         f"{'causal' if causal else 'full'},"
-        f"{t_auto:.4f},{t_bhd:.4f},{t_dispatch:.4f},{t_sdpa:.4f},"
-        f"{t_auto / t_bhd:.2f}x,{t_dispatch / t_bhd:.2f}x,{t_bhd / t_sdpa:.2f}x"
+        f"{t_auto:.4f},{t_bhd:.4f},{t_v7:.4f},{t_dispatch:.4f},{t_sdpa:.4f},"
+        f"{t_auto / t_bhd:.2f}x,{t_v7 / t_bhd:.2f}x,"
+        f"{t_dispatch / t_bhd:.2f}x,{t_bhd / t_sdpa:.2f}x"
     )

@@ -21,6 +21,15 @@ torch::Tensor flashattention_auto_forward(torch::Tensor q,
 
     const int64_t head_dim = q.size(-1);
     if (head_dim == 64) {
+        // v7 的额外成本是 Q fragment 初始化、同步和较高寄存器压力；序列
+        // 很短时，Q 只会复用少量 KV tile，v5 更适合作为稳定小问题路径。
+        // 两轮 N/BH sweep 在 N>=1024 上都观察到稳定收益，因此只把这个
+        // 经过验证的区间交给 v7，避免用一次 benchmark 过拟合所有 shape。
+        constexpr int64_t V7_MIN_N = 1024;
+        const int64_t n = (q.dim() == 4) ? q.size(2) : q.size(0);
+        if (n >= V7_MIN_N) {
+            return flashattention_v7_forward(q, k, v, causal);
+        }
         return flashattention_v5_forward(q, k, v, causal);
     }
     if (head_dim == 128) {
